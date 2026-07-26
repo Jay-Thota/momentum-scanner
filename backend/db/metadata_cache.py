@@ -7,13 +7,16 @@ Fetches and caches market_cap, sector, etf_symbol, earnings_next_date,
 si_pct, and days_to_cover with a 7-day TTL.  On subsequent scan runs the
 hot path never touches Yahoo for any of these fields.
 
+Failed lookups (timeout, 404, ETF/fund) are cached with a 1-day TTL so
+the same ticker is not retried within the same trading session.
+
 Public API:
     get_metadata(ticker, session)                -> dict
     get_metadata_batch(tickers, session, stats)  -> dict[str, dict]
 """
 
 import logging
-import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout, as_completed
 from datetime import date, datetime
 
 import yfinance as yf
@@ -25,23 +28,27 @@ from backend.db.models import MetadataCache
 
 logger = logging.getLogger(__name__)
 
-TTL_DAYS = 7
-_FETCH_DELAY_S = 0.5   # seconds between Yahoo calls in batch mode
+TTL_DAYS       = 7    # good data TTL
+TTL_DAYS_FAIL  = 1    # ETF / timeout / 404 TTL -- retry tomorrow
+_YAHOO_WORKERS = 5    # concurrent Yahoo calls in batch mode
+_YAHOO_TIMEOUT = 5    # per-ticker timeout (seconds)
 
 _YAHOO_ALIAS: dict[str, str] = {"BRK.B": "BRK-B", "BF.B": "BF-B"}
 
-# Bond/fund ETFs that yfinance returns 404 for -- skip without an HTTP call.
+# Known 404s -- skip without any HTTP call.
 _SKIP_TICKERS: frozenset[str] = frozenset({"BOND", "BSCU", "EMB", "IGIB"})
 
+# market_cap=None signals a failed/ETF/timeout fetch (1-day TTL, skipped by Layer 0).
+# market_cap=0.0 means the ticker was fetched but Yahoo returned no marketCap field.
 _EMPTY: dict = {
-    "market_cap":         0.0,
+    "market_cap":         None,
     "sector":             None,
     "etf_symbol":         None,
     "earnings_next_date": None,
     "si_pct":             None,
     "days_to_cover":      None,
-    "eps_growth":         None,   # True/False/None (stored as 1.0/0.0/None in DB)
-    "revenue_growth":     None,   # fractional YoY (e.g. 0.12 = 12%)
+    "eps_growth":         None,
+    "revenue_growth":     None,
 }
 
 
@@ -49,11 +56,15 @@ _EMPTY: dict = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _is_fresh(last_updated: str | None) -> bool:
-    if not last_updated:
+def _is_fresh(row: MetadataCache) -> bool:
+    if not row.last_updated:
         return False
     try:
-        return (datetime.now() - datetime.fromisoformat(last_updated)).days < TTL_DAYS
+        age_days = (datetime.now() - datetime.fromisoformat(row.last_updated)).days
+        # Failed/ETF entries (market_cap is None) get a 1-day TTL so they are
+        # retried on the next trading day without blocking today's run.
+        ttl = TTL_DAYS_FAIL if row.market_cap is None else TTL_DAYS
+        return age_days < ttl
     except Exception:
         return False
 
@@ -61,7 +72,7 @@ def _is_fresh(last_updated: str | None) -> bool:
 def _row_to_dict(row: MetadataCache) -> dict:
     eg = row.eps_growth
     return {
-        "market_cap":         row.market_cap or 0.0,
+        "market_cap":         row.market_cap or 0.0,  # None → 0.0 for L0 gate
         "sector":             row.sector,
         "etf_symbol":         row.etf_symbol,
         "earnings_next_date": row.earnings_next_date,
@@ -74,25 +85,34 @@ def _row_to_dict(row: MetadataCache) -> dict:
 
 def _fetch_from_yahoo(ticker: str) -> dict:
     """
-    Single Yahoo Finance fetch for all cacheable metadata.
-    Called only when the cache is stale or missing.
-    Tickers in _SKIP_TICKERS return empty metadata immediately without an HTTP call.
+    Fetch all cacheable metadata for one ticker from Yahoo Finance.
+
+    All network calls run inside a thread with a hard _YAHOO_TIMEOUT-second wall-clock
+    deadline.  Returns a dict; market_cap=None means "failed/ETF" and the caller
+    should use TTL_DAYS_FAIL when writing to cache.
     """
     if ticker in _SKIP_TICKERS:
-        logger.debug("_fetch_from_yahoo %s: skipped (known bond/fund, no yfinance data)", ticker)
+        logger.debug("_fetch_from_yahoo %s: skipped (known 404)", ticker)
         return dict(_EMPTY)
 
     yahoo_sym = _YAHOO_ALIAS.get(ticker, ticker)
-    out = dict(_EMPTY)
-    try:
+
+    def _all_calls() -> dict:
+        out = dict(_EMPTY)
         t    = yf.Ticker(yahoo_sym)
         info = t.info
+
+        # Structurally detect ETFs and mutual funds -- no market cap data useful.
+        quote_type = info.get("quoteType", "")
+        if quote_type in ("ETF", "MUTUALFUND"):
+            logger.debug("_fetch_from_yahoo %s: quoteType=%s -- caching as skip", ticker, quote_type)
+            return dict(_EMPTY)  # market_cap stays None → 1-day TTL
 
         mc = info.get("marketCap")
         out["market_cap"] = float(mc) if mc is not None else 0.0
 
         sector = info.get("sector")
-        out["sector"]    = sector
+        out["sector"]     = sector
         out["etf_symbol"] = SECTOR_ETF_MAP.get(sector) if sector else None
 
         si  = info.get("shortPercentOfFloat")
@@ -114,10 +134,9 @@ def _fetch_from_yahoo(ticker: str) -> dict:
         except Exception:
             pass
 
-        # -- Fundamentals from .financials (same cache TTL, no extra warm-run call) --
         try:
             import pandas as _pd
-            fin = t.financials   # rows=items, cols=dates newest-first
+            fin = t.financials
             if not fin.empty and fin.shape[1] >= 2:
                 if "Net Income" in fin.index:
                     ni_cur = fin.loc["Net Income"].iloc[0]
@@ -132,15 +151,28 @@ def _fetch_from_yahoo(ticker: str) -> dict:
                             out["revenue_growth"] = float((r_cur - r_prv) / r_prv)
                         break
         except Exception:
-            pass   # fundamentals unavailable -- eps_growth/revenue_growth stay None
+            pass
 
+        return out
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(_all_calls)
+            try:
+                return _fut.result(timeout=_YAHOO_TIMEOUT)
+            except _FuturesTimeout:
+                logger.warning(
+                    "_fetch_from_yahoo %s: timed out after %ds -- caching as skip",
+                    ticker, _YAHOO_TIMEOUT,
+                )
+                return dict(_EMPTY)  # market_cap=None → 1-day TTL
     except Exception as exc:
         _msg = str(exc)
         if "404" in _msg or "No data found" in _msg or "JSONDecodeError" in type(exc).__name__:
             logger.debug("_fetch_from_yahoo %s: not found (%s)", ticker, _msg)
         else:
             logger.warning("_fetch_from_yahoo %s: %s", ticker, exc)
-    return out
+    return dict(_EMPTY)
 
 
 def _upsert(session: Session, ticker: str, data: dict, row: MetadataCache | None) -> None:
@@ -153,7 +185,6 @@ def _upsert(session: Session, ticker: str, data: dict, row: MetadataCache | None
     row.earnings_next_date = data["earnings_next_date"]
     row.si_pct             = data["si_pct"]
     row.days_to_cover      = data["days_to_cover"]
-    # Store bool as float so SQLite Column(Float) accepts it cleanly.
     eg = data.get("eps_growth")
     row.eps_growth         = (1.0 if eg else 0.0) if eg is not None else None
     row.revenue_growth     = data.get("revenue_growth")
@@ -170,7 +201,7 @@ def get_metadata(ticker: str, session: Session) -> dict:
         select(MetadataCache).where(MetadataCache.ticker == ticker)
     ).scalar_one_or_none()
 
-    if row and _is_fresh(row.last_updated):
+    if row and _is_fresh(row):
         return _row_to_dict(row)
 
     data = _fetch_from_yahoo(ticker)
@@ -188,12 +219,14 @@ def get_metadata_batch(
     Batch metadata fetch with cache-first strategy.
 
     Fresh cached entries are returned immediately.  Stale/missing tickers are
-    fetched from Yahoo one at a time with a 0.5s inter-call delay to avoid
-    rate-limiting.
+    fetched in parallel (5 workers) with a 5-second per-ticker timeout to avoid
+    Railway cold-start hangs from Yahoo rate limiting.  All DB writes happen in
+    a single serial upsert after the parallel fetch completes.
 
     stats (optional) is populated with:
-        metadata_cache_hits    -- number of tickers served from cache
-        metadata_yahoo_calls   -- number of Yahoo .info calls made
+        metadata_cache_hits    -- tickers served from cache
+        metadata_yahoo_calls   -- Yahoo .info calls attempted
+        metadata_skipped       -- ETF/timeout/404 entries cached with 1-day TTL
     """
     if not tickers:
         return {}
@@ -201,7 +234,7 @@ def get_metadata_batch(
     result:   dict[str, dict] = {}
     to_fetch: list[tuple[str, MetadataCache | None]] = []
 
-    # Load all existing cache rows in a single query
+    # Load all existing cache rows in a single query.
     cached: dict[str, MetadataCache] = {
         row.ticker: row
         for row in session.execute(
@@ -211,28 +244,63 @@ def get_metadata_batch(
 
     for ticker in tickers:
         row = cached.get(ticker)
-        if row and _is_fresh(row.last_updated):
+        if row and _is_fresh(row):
             result[ticker] = _row_to_dict(row)
         else:
             to_fetch.append((ticker, row))
 
+    cache_hits = len(result)
+    total      = len(tickers)
+
     if stats is not None:
-        stats["metadata_cache_hits"]  = len(result)
+        stats["metadata_cache_hits"]  = cache_hits
         stats["metadata_yahoo_calls"] = len(to_fetch)
 
     logger.info(
         "MetadataCache: %d cache hits, %d Yahoo calls needed",
-        len(result), len(to_fetch),
+        cache_hits, len(to_fetch),
     )
 
-    for i, (ticker, existing_row) in enumerate(to_fetch):
-        if i > 0:
-            time.sleep(_FETCH_DELAY_S)
-        data = _fetch_from_yahoo(ticker)
+    if not to_fetch:
+        return result
+
+    # -- Parallel fetch (5 workers, 5s timeout each) --------------------------
+    fetched: dict[str, dict] = {}
+    skipped = 0
+    done    = 0
+
+    with ThreadPoolExecutor(max_workers=_YAHOO_WORKERS) as pool:
+        fmap = {pool.submit(_fetch_from_yahoo, ticker): ticker for ticker, _ in to_fetch}
+        for fut in as_completed(fmap):
+            ticker = fmap[fut]
+            done  += 1
+            try:
+                data = fut.result()
+            except Exception as exc:
+                logger.debug("metadata fetch error %s: %s", ticker, exc)
+                data = dict(_EMPTY)
+            fetched[ticker] = data
+            if data.get("market_cap") is None:
+                skipped += 1
+            if done % 50 == 0:
+                logger.info(
+                    "MetadataCache progress: %d/%d fetched (%d cache hits, %d skipped so far)",
+                    cache_hits + done, total, cache_hits, skipped,
+                )
+
+    if stats is not None:
+        stats["metadata_skipped"] = skipped
+
+    logger.info(
+        "MetadataCache fetch complete: %d fetched, %d skipped (ETF/timeout/404)",
+        len(fetched), skipped,
+    )
+
+    # -- Serial upsert (single session, no write contention) ------------------
+    for ticker, existing_row in to_fetch:
+        data = fetched.get(ticker, dict(_EMPTY))
         _upsert(session, ticker, data, existing_row)
         result[ticker] = data
 
-    if to_fetch:
-        session.commit()
-
+    session.commit()
     return result
