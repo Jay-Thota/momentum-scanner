@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.momentumscanner</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/test/momentum-scanner/venv/bin/python</string>
+        <string>-m</string>
+        <string>backend.scheduler</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/test/momentum-scanner</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/test/momentum-scanner/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Start automatically when the user logs in -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart immediately if the process exits for any reason -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle restarts: wait 30s before restarting after a crash -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/test/momentum-scanner/logs/scheduler.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/test/momentum-scanner/logs/scheduler.log</string>
+</dict>
+</plist>

@@ -1,0 +1,38 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Environment variables -- NEVER commit this
+.env
+.env.local
+frontend/.env.local
+
+# Database -- contains scan history, too large for git
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Scan results
+scan_results/
+
+# FINRA data cache
+data/finra/
+
+# Next.js
+frontend/.next/
+frontend/node_modules/
+frontend/out/
+
+# Mac
+.DS_Store
+
+# VS Code
+.vscode/
