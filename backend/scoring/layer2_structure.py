@@ -5,8 +5,8 @@ Max 2.0 pts -- 1.0 from archetype match (first wins), 1.0 from 2B momentum check
 
 import logging
 
+import numpy as np
 import pandas as pd
-import pandas_ta as ta
 
 from backend import config
 
@@ -16,20 +16,57 @@ _MIN_ROWS = 200  # need 200 for SMA-200; Alpaca IEX returns ~206 rows for 300-da
 
 
 # ---------------------------------------------------------------------------
+# Native indicator implementations (no pandas-ta dependency)
+# ---------------------------------------------------------------------------
+
+def _compute_sma(close: pd.Series, period: int) -> pd.Series:
+    return close.rolling(window=period).mean()
+
+
+def _compute_roc(close: pd.Series, period: int = 10) -> pd.Series:
+    return (close - close.shift(period)) / close.shift(period) * 100
+
+
+def _compute_adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+
+    up   = high - high.shift(1)
+    down = low.shift(1) - low
+
+    plus_dm  = pd.Series(np.where((up > down) & (up > 0),   up,   0.0), index=close.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=close.index)
+
+    plus_di  = 100 * (plus_dm.rolling(period).mean()  / atr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+
+    dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.rolling(period).mean()
+
+    return adx, plus_di, minus_di
+
+
+# ---------------------------------------------------------------------------
 # Indicator computation
 # ---------------------------------------------------------------------------
 
 def _add_indicators(ohlcv: pd.DataFrame) -> pd.DataFrame:
     df = ohlcv.copy()
-    df["ma20"]  = ta.sma(df["Close"], length=20)
-    df["ma50"]  = ta.sma(df["Close"], length=50)
-    df["ma200"] = ta.sma(df["Close"], length=200)
-    df["roc10"] = ta.roc(df["Close"], length=config.ROC_PERIOD)
+    df["ma20"]  = _compute_sma(df["Close"], 20)
+    df["ma50"]  = _compute_sma(df["Close"], 50)
+    df["ma200"] = _compute_sma(df["Close"], 200)
+    df["roc10"] = _compute_roc(df["Close"], config.ROC_PERIOD)
 
-    adx_df = ta.adx(df["High"], df["Low"], df["Close"], length=14)
-    df["adx"]  = adx_df["ADX_14"]
-    df["di_p"] = adx_df["DMP_14"]   # +DI
-    df["di_n"] = adx_df["DMN_14"]   # -DI
+    adx, plus_di, minus_di = _compute_adx(df["High"], df["Low"], df["Close"], period=14)
+    df["adx"]  = adx
+    df["di_p"] = plus_di   # +DI
+    df["di_n"] = minus_di  # -DI
     return df
 
 
