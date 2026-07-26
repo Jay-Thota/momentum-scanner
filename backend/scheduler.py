@@ -13,7 +13,10 @@ The scheduler blocks until interrupted (Ctrl+C / SIGTERM).
 import logging
 import time
 import traceback
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -127,21 +130,35 @@ def run_scan_job(force: bool = False, stats: dict | None = None) -> list:
 def main() -> None:
     init_db()
     scheduler = BlockingScheduler(timezone="America/New_York")
+
+    trigger = CronTrigger(
+        day_of_week="mon-fri",
+        hour=15,
+        minute=30,
+        timezone="America/New_York",
+    )
     scheduler.add_job(
         run_scan_job,
-        trigger=CronTrigger(
-            day_of_week="mon-fri",
-            hour=15,
-            minute=30,
-            timezone="America/New_York",
-        ),
+        trigger=trigger,
         id="daily_scan",
         name="Daily 3:30 PM ET momentum scan",
         misfire_grace_time=300,   # fire within 5 minutes of missed trigger
         coalesce=True,            # run at most once if multiple misfires stack up
     )
 
-    logger.info("Scheduler started -- daily scan fires Mon-Fri at 15:30 ET")
+    logger.info("Scheduler started -- daily scan fires Mon-Fri at 15:30 America/New_York")
+
+    # Compute next fire time directly from the trigger before scheduler.start() blocks.
+    # (Accessing job.next_run_time before start() raises AttributeError in APScheduler 3.x)
+    now_et    = datetime.now(_ET)
+    next_fire = trigger.get_next_fire_time(None, now_et)
+    if next_fire:
+        logger.info(
+            "Scheduler armed -- next scan: %s",
+            next_fire.astimezone(_ET).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        )
+    else:
+        logger.warning("Scheduler armed -- could not determine next fire time")
 
     try:
         scheduler.start()
