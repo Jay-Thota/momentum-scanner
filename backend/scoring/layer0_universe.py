@@ -21,9 +21,9 @@ def check(ticker: str, data_bundle: dict) -> bool:
         earnings_date -- date of next earnings, or None
         ohlcv_rows    -- number of OHLCV rows available (int, optional)
     """
-    price: float = data_bundle.get("price", 0.0)
-    avg_volume: float = data_bundle.get("avg_volume", 0.0)
-    market_cap: float = data_bundle.get("market_cap", 0.0)
+    price         = data_bundle.get("price", 0.0)
+    avg_volume    = data_bundle.get("avg_volume", 0.0)
+    market_cap    = data_bundle.get("market_cap", 0.0)
     earnings_date: date | None = data_bundle.get("earnings_date")
     ohlcv_rows: int | None = data_bundle.get("ohlcv_rows")
 
@@ -34,16 +34,16 @@ def check(ticker: str, data_bundle: dict) -> bool:
         )
         return False
 
-    if price < MIN_PRICE:
-        logger.debug("REJECT %s: price %.2f < %.2f", ticker, price, MIN_PRICE)
+    if price is None or price < MIN_PRICE:
+        logger.debug("REJECT %s: price %s < %.2f", ticker, price, MIN_PRICE)
         return False
 
-    if avg_volume < MIN_AVG_VOLUME:
-        logger.debug("REJECT %s: avg_volume %,.0f < %,.0f", ticker, avg_volume, MIN_AVG_VOLUME)
+    if avg_volume is None or avg_volume < MIN_AVG_VOLUME:
+        logger.debug("REJECT %s: avg_volume %s < %,.0f", ticker, avg_volume, MIN_AVG_VOLUME)
         return False
 
-    if market_cap < MIN_MARKET_CAP:
-        logger.debug("REJECT %s: market_cap %,.0f < %,.0f", ticker, market_cap, MIN_MARKET_CAP)
+    if market_cap is None or market_cap < MIN_MARKET_CAP:
+        logger.debug("REJECT %s: market_cap missing or below threshold", ticker)
         return False
 
     if earnings_date is not None:
