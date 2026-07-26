@@ -15,6 +15,7 @@ Usage:
         ...
 """
 
+import os
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
@@ -23,18 +24,24 @@ from sqlalchemy.orm import sessionmaker
 from backend import config
 from backend.db.models import Base
 
+# Railway PostgreSQL URLs start with postgres:// but SQLAlchemy needs postgresql://
+DATABASE_URL = os.getenv("DATABASE_URL", config.DATABASE_URL)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 # Resolve a relative sqlite:/// URL against the project root so the DB file
-# ends up at backend/db/scanner.db regardless of the working directory.
-_db_url = config.DATABASE_URL
+# ends up at the project root regardless of the working directory.
+_db_url = DATABASE_URL
 if _db_url.startswith("sqlite:///") and not _db_url.startswith("sqlite:////"):
     _rel = _db_url[len("sqlite:///"):]
     _abs = Path(__file__).resolve().parents[2] / _rel
     _abs.parent.mkdir(parents=True, exist_ok=True)
     _db_url = f"sqlite:///{_abs}"
 
+_is_sqlite = _db_url.startswith("sqlite://")
 engine = create_engine(
     _db_url,
-    connect_args={"check_same_thread": False},  # safe for single-writer use
+    connect_args={"check_same_thread": False} if _is_sqlite else {},
     echo=False,
 )
 
@@ -42,7 +49,10 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
 def _migrate() -> None:
-    """Additive schema migrations that create_all cannot handle (column additions)."""
+    """Additive schema migrations that create_all cannot handle (column additions).
+    SQLite-only: PostgreSQL uses create_all with checkfirst=True, which is sufficient."""
+    if not _is_sqlite:
+        return
     with engine.connect() as conn:
         scan_cols = {
             row[1]
