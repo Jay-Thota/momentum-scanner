@@ -144,11 +144,16 @@ def fetch_daily_bars_alpaca(
     tickers: list[str],
     lookback_days: int = 300,
     chunk_size: int = 200,
+    raw: bool = False,
 ) -> dict[str, list]:
     """
-    The raw Alpaca IEX daily bars behind fetch_daily_ohlcv_batch_alpaca:
+    The Alpaca IEX daily bars behind fetch_daily_ohlcv_batch_alpaca:
     {ticker: [Bar, ...]}, an empty list for tickers with no data or in a
     failed chunk. Returns an empty dict if Alpaca is not configured.
+
+    raw=True returns the API's JSON dicts ({"t", "o", "h", "l", "c", "v", ...})
+    instead of alpaca-py Bar models; building the models takes ~3 s for the
+    full universe.
     """
     if not (config.ALPACA_API_KEY and config.ALPACA_SECRET_KEY):
         logger.info("Alpaca keys not configured -- batch OHLCV unavailable")
@@ -162,7 +167,7 @@ def fetch_daily_bars_alpaca(
         logger.warning("alpaca-py not installed -- batch OHLCV unavailable")
         return {}
 
-    client   = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
+    client   = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, raw_data=raw)
     start_dt = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     end_dt   = datetime.now(timezone.utc)
 
@@ -179,9 +184,10 @@ def fetch_daily_bars_alpaca(
                 feed="iex",
             )
             bars = client.get_stock_bars(req)
+            by_symbol = bars if raw else bars.data   # raw: {symbol: [dict, ...]}
 
             for ticker in chunk:
-                result[ticker] = bars.data.get(ticker) or []
+                result[ticker] = by_symbol.get(ticker) or []
 
             have = sum(1 for t in chunk if result[t])
             logger.info(
