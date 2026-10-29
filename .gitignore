@@ -43,4 +43,4 @@ com.momentumscanner.plist
 engine/data/
 
 # C++ engine build tree
-engine/build/
+engine/build*/
