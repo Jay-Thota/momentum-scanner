@@ -36,9 +36,11 @@ target_compile_options(mscan_core PRIVATE -Wall -Wextra -Wpedantic -Werror
 if(MSCAN_BUILD_TESTS)
   include(FetchContent)
   FetchContent_Declare(googletest
-    URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz)
+    URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
   FetchContent_Declare(benchmark
-    URL https://github.com/google/benchmark/archive/refs/tags/v1.9.0.tar.gz)
+    URL https://github.com/google/benchmark/archive/refs/tags/v1.9.0.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
   set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest benchmark)
 
