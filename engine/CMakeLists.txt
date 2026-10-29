@@ -7,7 +7,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # core lib gets linked into the .so
 
 option(MSCAN_SANITIZE "Build with ASan + UBSan" OFF)
 option(MSCAN_TSAN "Build with ThreadSanitizer (exclusive with ASan)" OFF)
-option(MSCAN_PYTHON "Build pybind11 module" ON)
+# OFF until phase 3 writes the bindings (bindings.cpp still has undefined TODOs)
+option(MSCAN_PYTHON "Build pybind11 module" OFF)
 
 if(MSCAN_SANITIZE)
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
