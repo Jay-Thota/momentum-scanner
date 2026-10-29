@@ -68,7 +68,9 @@ def score(data_bundle: dict) -> dict:
     up_vol: float = recent_window.loc[recent_window["_diff"] > 0, "Volume"].sum()
     down_vol: float = recent_window.loc[recent_window["_diff"] < 0, "Volume"].sum()
     up_down_ratio: float = up_vol / max(down_vol, 1.0)
-    sig_C: bool = up_down_ratio > config.UP_DOWN_VOL_RATIO_MIN
+    # bool(): up_down_ratio is a numpy.float64, and a numpy bool would be stored
+    # by save_results_to_db's json.dumps(default=str) as the string "True"
+    sig_C: bool = bool(up_down_ratio > config.UP_DOWN_VOL_RATIO_MIN)
 
     # -- Signal D: today's OBV at or above its 20-day rolling high ------------
     recent_obv = ohlcv["OBV"].iloc[-lookback:]

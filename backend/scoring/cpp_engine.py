@@ -59,10 +59,4 @@ def score_l1l2_cpp(tickers: list[str], ohlcv_map: Mapping[str, pd.DataFrame]) ->
     results = mscan_engine.score_l1l2_batch(
         list(tickers), *(arrays[f] for f in FIELDS), engine_config(), dates=dates,
     )
-    for r in results:
-        # Python's layer1 signal C is a numpy bool (it compares a numpy.float64),
-        # which save_results_to_db's json.dumps(default=str) stores as the string
-        # "True"/"False". Match it so the stored JSON is the same on both paths.
-        if "C" in r["l1"]["signals"]:
-            r["l1"]["signals"]["C"] = np.bool_(r["l1"]["signals"]["C"])
     return dict(zip(tickers, results))
