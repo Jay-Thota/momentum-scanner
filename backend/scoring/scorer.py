@@ -191,6 +191,39 @@ def score_stock(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _score_l1l2_python(tickers: list[str], ohlcv_map: dict[str, pd.DataFrame]) -> dict[str, dict]:
+    l1l2_map: dict[str, dict] = {}
+    for ticker in tickers:
+        df = ohlcv_map[ticker]
+        l1 = layer1.score({"ticker": ticker, "ohlcv": df, "block_trades": 0})
+        l2 = layer2.score({
+            "ticker":           ticker,
+            "ohlcv":            df,
+            "sector_etf_ohlcv": pd.DataFrame(),  # sector unknown until Step 6
+            "sector_rs_rank":   None,
+        })
+        l1l2_map[ticker] = {"l1": l1, "l2": l2}
+    return l1l2_map
+
+
+def score_l1l2(
+    tickers: list[str], ohlcv_map: dict[str, pd.DataFrame], use_cpp: bool | None = None,
+) -> dict[str, dict]:
+    """
+    Step 4: layer 1 + layer 2 for every ticker -> {ticker: {"l1": ..., "l2": ...}}.
+    Runs on the C++ engine when use_cpp (default config.USE_CPP_ENGINE) is set,
+    falling back to Python if the engine is not installed or raises.
+    """
+    if config.USE_CPP_ENGINE if use_cpp is None else use_cpp:
+        try:
+            from backend.scoring.cpp_engine import score_l1l2_cpp
+            return score_l1l2_cpp(tickers, ohlcv_map)
+        except Exception as exc:
+            logger.warning("C++ engine unavailable or failed (%s: %s) -- using Python for Step 4",
+                           type(exc).__name__, exc)
+    return _score_l1l2_python(tickers, ohlcv_map)
+
+
 def _prefetch_sector_data() -> tuple[dict, dict, dict]:
     """Pre-fetch ETF momentum stats, daily OHLCV, and peer returns for all 11 sectors."""
     all_etfs: list[str]              = list(SECTOR_PEERS.keys())
@@ -284,17 +317,7 @@ def run_daily_scan(stats: dict | None = None) -> list["ScoringResult"]:
 
     # ── Step 4: L1 + L2 on OHLCV only (no Yahoo) ───────────────────────────
     logger.info("Step 4: L1+L2 scoring on %d tickers ...", len(l0_pv_pass))
-    l1l2_map: dict[str, dict] = {}
-    for ticker in l0_pv_pass:
-        df = ohlcv_map[ticker]
-        l1 = layer1.score({"ticker": ticker, "ohlcv": df, "block_trades": 0})
-        l2 = layer2.score({
-            "ticker":           ticker,
-            "ohlcv":            df,
-            "sector_etf_ohlcv": pd.DataFrame(),  # sector unknown until Step 6
-            "sector_rs_rank":   None,
-        })
-        l1l2_map[ticker] = {"l1": l1, "l2": l2}
+    l1l2_map = score_l1l2(l0_pv_pass, ohlcv_map)
 
     # ── Step 5: Early exit ─────────────────────────────────────────────────
     survivors: list[str] = [
