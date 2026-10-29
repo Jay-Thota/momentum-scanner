@@ -19,7 +19,8 @@ import time
 
 import mscan_engine
 
-from backend.scoring.cpp_engine import _FIELDS, engine_config, score_l1l2_cpp, stack_ohlcv
+from backend.data.ohlcv_batch import FIELDS as _FIELDS
+from backend.scoring.cpp_engine import engine_config, score_l1l2_cpp, stack_ohlcv
 from backend.scoring.scorer import _score_l1l2_python
 from backend.tests.validate_cpp_engine import PRODUCTION_SESSIONS, panel_frames
 

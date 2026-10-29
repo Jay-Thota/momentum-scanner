@@ -12,9 +12,15 @@ missing day is scored on exactly the rows Python would see. A parallel
 int64 array of YYYYMMDD dates lets the engine report breakout dates the way
 layer2 does (str(index)[:10]).
 
+When run_daily_scan built a LazyOhlcvMap (USE_CPP_ENGINE on), the arrays
+already exist and are passed as they are. A plain {ticker: DataFrame} dict is
+converted first.
+
 Public API:
     score_l1l2_cpp(tickers, ohlcv_map) -> {ticker: {"l1": dict, "l2": dict}}
 """
+
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -22,8 +28,7 @@ import pandas as pd
 import mscan_engine
 
 from backend import config
-
-_FIELDS = ("Open", "High", "Low", "Close", "Volume")
+from backend.data.ohlcv_batch import FIELDS, LazyOhlcvMap, OhlcvBatch
 
 # Every config value layers 1 and 2 read, passed live so .env overrides apply
 _CONFIG_KEYS = (
@@ -41,29 +46,18 @@ def engine_config() -> dict:
 
 
 def stack_ohlcv(
-    tickers: list[str], ohlcv_map: dict[str, pd.DataFrame],
+    tickers: list[str], ohlcv_map: Mapping[str, pd.DataFrame],
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """({field: (T, D) float64}, (T, D) int64 dates), right-aligned and NaN/0-padded."""
-    frames = [ohlcv_map.get(t, pd.DataFrame()) for t in tickers]
-    d = max((len(df) for df in frames), default=0)
-    arrays = {f: np.full((len(tickers), d), np.nan) for f in _FIELDS}
-    dates = np.zeros((len(tickers), d), dtype=np.int64)
-    for i, df in enumerate(frames):
-        k = len(df)
-        if k == 0:
-            continue
-        for f in _FIELDS:
-            arrays[f][i, d - k:] = df[f].to_numpy(dtype=np.float64)
-        # Same calendar date str(ts)[:10] gives: the timestamp's own timezone
-        idx = pd.DatetimeIndex(df.index)
-        dates[i, d - k:] = idx.year * 10000 + idx.month * 100 + idx.day
-    return arrays, dates
+    if isinstance(ohlcv_map, LazyOhlcvMap):
+        return ohlcv_map.batch.rows(tickers)
+    return OhlcvBatch.from_frames(tickers, ohlcv_map).rows(tickers)
 
 
-def score_l1l2_cpp(tickers: list[str], ohlcv_map: dict[str, pd.DataFrame]) -> dict[str, dict]:
+def score_l1l2_cpp(tickers: list[str], ohlcv_map: Mapping[str, pd.DataFrame]) -> dict[str, dict]:
     arrays, dates = stack_ohlcv(tickers, ohlcv_map)
     results = mscan_engine.score_l1l2_batch(
-        list(tickers), *(arrays[f] for f in _FIELDS), engine_config(), dates=dates,
+        list(tickers), *(arrays[f] for f in FIELDS), engine_config(), dates=dates,
     )
     for r in results:
         # Python's layer1 signal C is a numpy bool (it compares a numpy.float64),
