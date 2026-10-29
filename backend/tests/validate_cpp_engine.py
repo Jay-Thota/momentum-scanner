@@ -10,13 +10,15 @@ Python loop and the C++ engine, and asserts identical results:
     production lookback (last ~300 calendar days) and at full 4-year length
 
 "Identical" means the same keys in the same order, equal ints/bools/strings,
-and bit-equal floats (NaN matching NaN, -0.0 distinct from 0.0).
+bit-equal floats (NaN matching NaN, -0.0 distinct from 0.0), and the same
+signals JSON as save_results_to_db would store.
 
 Requires the engine: pip install -e engine
 Run with:
     python -m backend.tests.validate_cpp_engine
 """
 
+import json
 import logging
 import math
 import sys
@@ -133,6 +135,12 @@ def run(name: str, frames: dict[str, pd.DataFrame]) -> bool:
     diffs: list[str] = []
     for t in tickers:
         compare(py[t], cpp[t], t, diffs)
+        # What save_results_to_db stores must match too (numpy bools become "True")
+        for layer in ("l1", "l2"):
+            a = json.dumps(py[t][layer]["signals"], default=str)
+            b = json.dumps(cpp[t][layer]["signals"], default=str)
+            if a != b:
+                diffs.append(f"{t}.{layer}: stored JSON differs: {a} != {b}")
     arch = pd.Series([py[t]["l2"]["archetype"] for t in tickers]).value_counts(dropna=False).to_dict()
     status = "[PASS]" if not diffs else "[FAIL]"
     print(f"  {status}  {name}: {len(tickers)} tickers, {len(diffs)} differences"
