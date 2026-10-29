@@ -76,7 +76,7 @@ fetching, L0 mcap/earnings, L3, L4, L5, API, DB, alerts, scheduler.
 [x] backend/alerts/ -- email (Gmail SMTP) + Slack (incoming webhook) alerts
 [x] backend/scheduler.py -- APScheduler cron at 3PM ET, market holiday aware
 [x] Engine phase 1 -- scripts/export_history.py + scripts/dump_golden.py
-[ ] Engine phase 2 -- Universe (mmap) + indicator kernels + parity tests
+[x] Engine phase 2 -- Universe (mmap) + indicator kernels + parity tests
 [ ] Engine phase 3 -- score_layer1/2 + pybind11 + USE_CPP_ENGINE swap in Step 4
 [ ] Engine phase 4 -- ThreadPool + Google Benchmark vs Python Step 4
 [ ] Engine phase 5 -- StreamingIndicators + backtester + CI + README
