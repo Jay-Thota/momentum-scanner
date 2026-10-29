@@ -35,7 +35,10 @@ add_library(mscan_core
   src/thread_pool.cpp
   src/backtest.cpp)
 target_include_directories(mscan_core PUBLIC include)
-target_compile_options(mscan_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_compile_options(mscan_core PRIVATE -Wall -Wextra -Wpedantic -Werror
+  # Parity with numpy/pandas: never fuse a*b+c into one FMA (one rounding
+  # instead of two), which would drift results by a few ULPs.
+  -ffp-contract=off)
 
 # ---- tests ------------------------------------------------------------------
 enable_testing()
