@@ -25,6 +25,7 @@ scan_results/
 
 # FINRA data cache
 backend/data/finra_cache/
+data/finra/
 
 # Next.js
 frontend/.next/
