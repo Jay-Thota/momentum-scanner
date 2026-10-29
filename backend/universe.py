@@ -68,6 +68,42 @@ def _batch_price_vol(tickers: list[str]) -> dict[str, tuple[float, float] | None
 # Alpaca fetch + market cap filter
 # ---------------------------------------------------------------------------
 
+def _parse_assets(raw_assets: list[dict]) -> list:
+    """
+    Validate raw asset dicts one at a time so an asset alpaca-py cannot model
+    (e.g. an exchange missing from its AssetExchange enum, like TXSE) is skipped
+    instead of failing the whole list.  Logs what was skipped.
+    """
+    from collections import Counter
+
+    from alpaca.trading.models import Asset
+    from pydantic import ValidationError
+
+    assets: list = []
+    skipped: Counter = Counter()
+    examples: dict[str, list[str]] = {}
+    for raw in raw_assets:
+        try:
+            assets.append(Asset(**raw))
+        except ValidationError:
+            exchange = str(raw.get("exchange", "?"))
+            skipped[exchange] += 1
+            examples.setdefault(exchange, [])
+            if len(examples[exchange]) < 5:
+                examples[exchange].append(str(raw.get("symbol", "?")))
+
+    if skipped:
+        logger.warning(
+            "Skipped %d Alpaca assets that failed validation: %s",
+            sum(skipped.values()),
+            "  ".join(
+                f"{exc}={n} (e.g. {', '.join(examples[exc])})"
+                for exc, n in skipped.most_common()
+            ),
+        )
+    return assets
+
+
 def _fetch_fresh() -> tuple[list[dict], dict]:
     if not (config.ALPACA_API_KEY and config.ALPACA_SECRET_KEY):
         logger.warning("Alpaca keys not configured -- universe fetch unavailable")
@@ -81,10 +117,13 @@ def _fetch_fresh() -> tuple[list[dict], dict]:
         logger.error("alpaca-py not installed")
         return [], {}
 
-    client = TradingClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, paper=True)
-    assets = client.get_all_assets(
-        GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE)
+    # raw_data=True returns plain dicts; _parse_assets validates them one by one
+    client = TradingClient(
+        config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, paper=True, raw_data=True,
     )
+    assets = _parse_assets(client.get_all_assets(
+        GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE)
+    ))
 
     target = {AssetExchange.NYSE, AssetExchange.NASDAQ}
     pre: list[dict] = []
@@ -207,7 +246,14 @@ def get_universe(
         logger.info("Universe loaded from cache: %d tickers", len(tickers))
         return tickers
 
-    rows, refresh_stats = _fetch_fresh()
+    try:
+        rows, refresh_stats = _fetch_fresh()
+    except Exception as exc:
+        logger.warning(
+            "Universe refresh failed: %s: %s",
+            type(exc).__name__, str(exc).splitlines()[0] if str(exc) else "",
+        )
+        rows, refresh_stats = [], {}
 
     if stats is not None:
         stats.update(refresh_stats)
