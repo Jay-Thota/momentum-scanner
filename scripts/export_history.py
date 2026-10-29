@@ -22,13 +22,32 @@ that are also NaN (never forward-filled) and logged in three groups:
     before the gap is blanked so the older listing becomes left padding
   - holes: shorter interior runs (IEX no-trade days in thin names)
 
-Binary writer: engine/include/mscan/universe.h (FileHeader) does not exist in
-this repo yet, so the binary step is not implemented.  Use --from-panel to add
-it later without refetching.
+The panel is then written as the engine's binary file (--bin), the layout
+Universe::open_mmap reads (engine/include/mscan/universe.h):
+
+    offset 0                FileHeader, 40 bytes, little-endian:
+                              char[8] magic "MSCANV01", u32 version,
+                              u32 num_tickers, u32 num_days, 4 pad bytes,
+                              u64 tickers_offset, u64 fields_offset
+    offset 40               dates: int32[num_days] YYYYMMDD
+    tickers_offset          tickers: num_tickers ASCII names, each NUL-terminated
+    (zero padding to a multiple of 8)
+    fields_offset           open, high, low, close, volume: each float64
+                            [num_tickers * num_days], index ticker * num_days + day
+
+The 4 pad bytes are the ones a C++ compiler inserts before the first uint64,
+so sizeof(FileHeader) == 40 on every mainstream ABI.  fields_offset is 8-byte
+aligned so the mmapped doubles can be read in place.  The kind/source/first
+arrays stay in the .npz only; the engine recomputes first-valid at load.
+
+--from-panel skips the fetch and rebuilds the binary from an existing panel.
+scripts/read_history_bin.py round-trips the binary against the panel.
 """
 
 import argparse
 import logging
+import os
+import struct
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -51,6 +70,40 @@ logger = logging.getLogger("export_history")
 FIELDS = ["Open", "High", "Low", "Close", "Volume"]
 KIND_BENCHMARK, KIND_SECTOR_ETF, KIND_EQUITY = 0, 1, 2
 REUSED_SYMBOL_GAP = 20   # sessions; shortest observed reuse gap was 264, longest hole 5
+
+# Mirrors mscan::FileHeader, including the 4 bytes of padding before tickers_offset
+BIN_MAGIC = b"MSCANV01"
+BIN_VERSION = 1
+BIN_HEADER = struct.Struct("<8sIII4xQQ")
+assert BIN_HEADER.size == 40
+
+
+def write_history_bin(panel: dict[str, np.ndarray], path: Path) -> None:
+    """Write the panel in the engine's MSCANV01 format (see module docstring)."""
+    symbols = [str(s) for s in panel["symbols"]]
+    dates = np.ascontiguousarray(panel["dates"], dtype="<i4")
+    n, d = len(symbols), len(dates)
+
+    blob = b"".join(s.encode("ascii") + b"\0" for s in symbols)
+    tickers_offset = BIN_HEADER.size + dates.nbytes
+    fields_offset = (tickers_offset + len(blob) + 7) // 8 * 8
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as fh:
+        fh.write(BIN_HEADER.pack(BIN_MAGIC, BIN_VERSION, n, d, tickers_offset, fields_offset))
+        fh.write(dates.tobytes())
+        fh.write(blob)
+        fh.write(b"\0" * (fields_offset - tickers_offset - len(blob)))
+        for f in FIELDS:
+            arr = np.ascontiguousarray(panel[f.lower()], dtype="<f8")
+            if arr.shape != (n, d):
+                raise ValueError(f"{f} has shape {arr.shape}, expected {(n, d)}")
+            fh.write(arr.tobytes())
+    os.replace(tmp, path)   # readers never see a half-written file
+
+    expected = fields_offset + len(FIELDS) * n * d * 8
+    if path.stat().st_size != expected:
+        raise RuntimeError(f"{path}: wrote {path.stat().st_size} bytes, expected {expected}")
 
 
 def _nan_runs(missing: np.ndarray) -> list[tuple[int, int]]:
@@ -155,6 +208,7 @@ def main() -> None:
     ap.add_argument("--panel", type=Path, default=Path("engine/data/history_panel.npz"))
     ap.add_argument("--from-panel", action="store_true",
                     help="load --panel instead of fetching")
+    ap.add_argument("--bin", type=Path, default=Path("engine/data/history.bin"))
     args = ap.parse_args()
 
     if args.from_panel:
@@ -167,7 +221,10 @@ def main() -> None:
         np.savez_compressed(args.panel, **panel)
         logger.info("Wrote %s (%.1f MB)", args.panel, args.panel.stat().st_size / 1e6)
 
-    logger.warning("Binary export skipped: FileHeader (engine/include/mscan/universe.h) not found")
+    args.bin.parent.mkdir(parents=True, exist_ok=True)
+    write_history_bin(panel, args.bin)
+    logger.info("Wrote %s (%.1f MB, %d symbols x %d sessions)", args.bin,
+                args.bin.stat().st_size / 1e6, len(panel["symbols"]), len(panel["dates"]))
 
 
 if __name__ == "__main__":
