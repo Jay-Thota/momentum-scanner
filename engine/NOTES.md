@@ -207,3 +207,109 @@ not a faster engine or more threads.
 compiled module into the venv. Tests are switched off in that build so pip
 never downloads googletest. Plain CMake builds still produce the tests and
 the module for development.
+
+---
+
+## Phase 4: data path, thread pool, benchmarks
+
+**Phase 3 said 15.7x faster. Why did phase 4 start by measuring again?**
+Phase 3 timed only the step it changed. Timing from the API response to the
+end of Step 4 showed where the time really went: 3.1 s for alpaca-py to turn
+the JSON into Bar objects and 3.0 s to turn those into DataFrames, against
+36 ms in the engine. End to end, phase 3 was only 2.2x faster. Lesson: time
+the whole path a user waits on, not the part you just rewrote.
+
+**What changed in the data path?**
+With the C++ path on, the scan asks Alpaca for raw JSON and fills the engine's
+arrays straight from it, parsing all timestamps in one vectorized call. No Bar
+objects and no DataFrames for the ~3,300 tickers. A lazy mapping builds a
+DataFrame only when a later step asks for that ticker (about 1,500 survivors).
+Response to end of Step 4: 15.7 s to 0.41 s (38x); counting the later
+survivor DataFrames, about 1.3 s.
+
+**How do you keep the downstream code working?**
+`LazyOhlcvMap` behaves like the `{ticker: DataFrame}` dict the scan always
+passed around, so later steps didn't change. The DataFrames it builds are
+identical to the old ones, down to the index's timezone object, and a test
+checks that for every ticker in the real universe.
+
+**How does the thread pool work?**
+A queue of tasks guarded by one mutex, and N worker threads that sleep on a
+condition variable until there is work. `submit` wraps the task in a
+`std::packaged_task`, so its return value or exception lands in a
+`std::future` the caller can wait on.
+
+**Why one shared queue and not work stealing?**
+Tasks here are coarse: one chunk of ~100 tickers taking milliseconds. Taking
+a lock once per chunk is noise. Work stealing (a queue per thread, idle
+threads stealing from others) pays off when tasks are tiny and numerous and
+the shared lock becomes the bottleneck.
+
+**What happens on shutdown?**
+The destructor marks the pool as stopping (new submits throw), asks every
+thread to stop, and joins them. Workers keep taking tasks until the queue is
+empty, so queued work still runs. The join must happen in the destructor
+body: C++ destroys members in reverse order of declaration, so if the threads
+were joined by the vector's own destructor, the mutex and condition variable
+would already be gone while threads still used them.
+
+**Why `std::jthread` and `condition_variable_any`?**
+A jthread carries a stop token and joins itself when destroyed.
+`condition_variable_any::wait` can take that stop token, so a sleeping
+worker wakes up when stop is requested; no extra flag or broadcast needed.
+
+**What if a task throws?**
+packaged_task catches it and stores it in the future, so the worker thread
+survives and the exception reappears where the caller calls `.get()`.
+`parallel_for` waits for every chunk before rethrowing, because the chunks
+hold a reference to the caller's function.
+
+**Why ~4 chunks per thread in parallel_for?**
+Tickers cost different amounts (a 4-year history costs much more than a
+recent IPO). With exactly one chunk per thread, everyone waits for the
+slowest chunk. With several smaller chunks, threads that finish early pick
+up more, so they all finish at about the same time.
+
+**How do you test concurrent code?**
+Tests for each promise the pool makes (every index covered exactly once,
+queued work finishes on shutdown, submit during shutdown throws, exceptions
+reach the caller), run many times, then the whole suite under
+ThreadSanitizer, which flags unsynchronized access even when the test
+happened to pass.
+
+**Where does scaling stop, and why?** (M3 Pro: 5 performance + 6 efficiency
+cores; battery, Low Power Mode)
+
+| threads | backtest, every day (3.07M scores) | production scan |
+|---|---|---|
+| 1 | 51.3 s | 33.2 ms |
+| 2 | 25.6 s (2.0x) | 16.8 ms (2.0x) |
+| 4 | 13.1 s (3.9x) | 9.0 ms (3.7x) |
+| 8 | 8.4 s (6.1x) | 8.8 ms (3.8x) |
+| 11 | 7.6 s (6.8x) | 9.1 ms (3.7x) |
+
+The backtest is nearly perfect up to 4 threads: each ticker's data and
+scratch arrays fit in the core's own caches, and threads share nothing but
+one atomic add per chunk. Past 5 threads the extra threads land on efficiency
+cores. If one of those does about 0.37 of a performance core's work,
+5 + 3 x 0.37 = 6.1x at 8 threads (measured 6.1x) and 5 + 6 x 0.37 = 7.2x at
+11 (measured 6.8x). The hardware stops scaling, not the code.
+
+The production scan stops at about 4 threads for a different reason: the
+whole job is 33 ms. Split 8 ways, each chunk is about a millisecond, so
+waking threads, handing out chunks and waiting for the last (slowest, often
+on an efficiency core) chunk are a big share of the total. Small jobs don't
+parallelize well; the scan stays single-threaded, since 36 ms isn't worth it.
+
+**What's still slow?**
+The backtest recomputes every indicator over the whole history for every
+day, so its cost grows with days squared: 51 s single-threaded. Phase 5's
+streaming indicators update each day in O(1) instead. That is a far bigger
+win than any number of threads.
+
+**The "True" string bug.**
+Layer 1 signal C came out of a numpy comparison, so it was a numpy bool, and
+`json.dumps(..., default=str)` stored it as the string "True" or "False".
+In JavaScript the string "False" is truthy. Phase 3 matched the quirk so the
+two paths could be compared exactly; phase 4 fixed it in both paths in its
+own commit. Rows stored before the fix still hold the strings.
