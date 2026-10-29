@@ -62,6 +62,7 @@ if(MSCAN_BUILD_TESTS)
   # ---- benchmarks -----------------------------------------------------------
   add_executable(mscan_bench bench/score_bench.cpp)
   target_link_libraries(mscan_bench PRIVATE mscan_core benchmark::benchmark_main)
+  target_compile_definitions(mscan_bench PRIVATE MSCAN_ENGINE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 # ---- python module ----------------------------------------------------------
