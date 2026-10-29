@@ -115,6 +115,18 @@ TEST(Parity, RocMatchesPython) {
   }
 }
 
+TEST(Parity, AdxMatchesPython) {
+  for (const auto& g : goldens()) {
+    const std::size_t n = g.size();
+    std::vector<double> adx(n), plus_di(n), minus_di(n);
+    mscan::BarSeries bars{g.col("Open"), g.col("High"), g.col("Low"), g.col("Close"), g.col("Volume")};
+    ind::adx(bars, 14, {adx, plus_di, minus_di});   // period hard-coded in layer2._add_indicators
+    expect_bit_identical(adx, g.col("adx"), g.name, "adx");
+    expect_bit_identical(plus_di, g.col("di_p"), g.name, "di_p");
+    expect_bit_identical(minus_di, g.col("di_n"), g.name, "di_n");
+  }
+}
+
 TEST(Parity, ObvMatchesPython) {
   for (const auto& g : goldens()) {
     std::vector<double> out(g.size());
