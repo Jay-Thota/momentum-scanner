@@ -58,7 +58,12 @@ fetching, L0 mcap/earnings, L3, L4, L5, API, DB, alerts, scheduler.
 - Small commits, one concern each.
 
 ### Engine commands
-- Build: cmake -S engine -B engine/build && cmake --build engine/build
+- One-time: venv/bin/pip install pybind11 (the CMake build asks the venv's Python for it)
+- Build: cmake -S engine -B engine/build -DPython_EXECUTABLE=$PWD/venv/bin/python && cmake --build engine/build
+  (or activate the venv first; add -DMSCAN_PYTHON=OFF to skip the Python module)
+- Python module: venv/bin/pip install -e engine (rerun after C++ changes); enable with USE_CPP_ENGINE=true
+- Step 4 parity (Python vs C++): python -m backend.tests.validate_cpp_engine
+- Step 4 timing: python -m scripts.bench_step4
 - Tests: ctest --test-dir engine/build
 - Sanitizers: add -DMSCAN_SANITIZE=ON (ASan+UBSan) or -DMSCAN_TSAN=ON
 - Benchmarks: engine/build/mscan_bench
@@ -77,6 +82,6 @@ fetching, L0 mcap/earnings, L3, L4, L5, API, DB, alerts, scheduler.
 [x] backend/scheduler.py -- APScheduler cron at 3PM ET, market holiday aware
 [x] Engine phase 1 -- scripts/export_history.py + scripts/dump_golden.py
 [x] Engine phase 2 -- Universe (mmap) + indicator kernels + parity tests
-[ ] Engine phase 3 -- score_layer1/2 + pybind11 + USE_CPP_ENGINE swap in Step 4
+[x] Engine phase 3 -- score_layer1/2 + pybind11 + USE_CPP_ENGINE swap in Step 4
 [ ] Engine phase 4 -- ThreadPool + Google Benchmark vs Python Step 4
 [ ] Engine phase 5 -- StreamingIndicators + backtester + CI + README
