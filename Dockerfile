@@ -14,6 +14,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# C++ scoring engine (the mscan_engine module, used when USE_CPP_ENGINE=true).
+# Built from engine/ alone, before the rest of the code is copied, so this
+# layer is only rebuilt when engine/ changes.
+RUN apt-get update && apt-get install -y cmake && rm -rf /var/lib/apt/lists/*
+COPY engine/ engine/
+RUN pip install --no-cache-dir ./engine
+
 # Copy application code
 COPY . .
 
