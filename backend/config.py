@@ -42,6 +42,10 @@ MA_BONUS_PER_LEVEL = float(os.getenv("MA_BONUS_PER_LEVEL", "0.17"))
 L2_MOMENTUM_A_SCORE = float(os.getenv("L2_MOMENTUM_A_SCORE", "0.25"))
 L2_MOMENTUM_B_SCORE = float(os.getenv("L2_MOMENTUM_B_SCORE", "0.25"))
 
+# Step 4 (L1 + L2) on the C++ engine (engine/, `pip install -e engine`).
+# Off by default; scorer falls back to Python if the module is missing or fails.
+USE_CPP_ENGINE = os.getenv("USE_CPP_ENGINE", "false").strip().lower() in ("1", "true", "yes", "on")
+
 # Layer 3 -- options flow
 # Signal A: call_vol/call_OI ratio threshold, tiered by avg daily option volume
 # (call_vol + put_vol from front expiry chain)

@@ -1,0 +1,25 @@
+# `pip install -e engine` (or `pip install ./engine`) builds the mscan_engine
+# extension with CMake via scikit-build-core. Tests are left out of this build;
+# run them with the plain CMake commands in .claude/CLAUDE.md.
+
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "mscan-engine"
+version = "0.1.0"
+description = "C++ layer 1/2 scoring engine for momentum-scanner"
+requires-python = ">=3.11"
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+cmake.build-type = "Release"
+# Keeps the build tree under engine/build-* (gitignored) and reuses it, so
+# reinstalling after a C++ change only recompiles what changed.
+build-dir = "build-pip/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+MSCAN_PYTHON = "ON"
+MSCAN_BUILD_TESTS = "OFF"
