@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "alloc_counter.h"
 #include "mscan/indicators.h"
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,8 @@
 namespace {
 std::atomic<long> g_allocations{0};
 }
+
+long mscan_test::allocations() { return g_allocations.load(); }
 
 void* operator new(std::size_t n) {
   ++g_allocations;
