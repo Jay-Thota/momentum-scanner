@@ -6,7 +6,6 @@ Endpoints:
     GET /stock/{ticker}/options-history  -- last 10 OptionsHistory rows
 """
 
-import json
 from datetime import date, timedelta
 from typing import Any, Optional
 
@@ -14,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from backend.api.signals import load_signals
 from backend.db.database import SessionLocal
 from backend.db.models import MetadataCache, OptionsHistory, ScanResult, StockSignals
 
@@ -62,8 +62,6 @@ class OptionsHistoryResponse(BaseModel):
 
 
 def _row_to_appearance(row: ScanResult, signal_rows: list[StockSignals]) -> StockAppearance:
-    signals = {s.signal_key: json.loads(s.signal_value) if s.signal_value else None
-               for s in signal_rows}
     return StockAppearance(
         scan_date=row.scan_date,
         ticker=row.ticker,
@@ -77,7 +75,7 @@ def _row_to_appearance(row: ScanResult, signal_rows: list[StockSignals]) -> Stoc
         archetype=row.archetype,
         regime=row.regime,
         timestamp=row.timestamp,
-        signals=signals,
+        signals=load_signals(signal_rows),
     )
 
 

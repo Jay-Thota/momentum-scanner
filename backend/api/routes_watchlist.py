@@ -7,7 +7,6 @@ Endpoints:
     GET /watchlist/{scan_date}    -- full ranked list for a specific date (YYYY-MM-DD)
 """
 
-import json
 from datetime import date
 from typing import Any, Optional
 
@@ -15,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
+from backend.api.signals import load_signals
 from backend.db.database import SessionLocal
 from backend.db.models import ScanResult, StockSignals
 
@@ -50,8 +50,6 @@ class HistoryEntry(BaseModel):
 
 
 def _row_to_entry(row: ScanResult, signal_rows: list[StockSignals]) -> WatchlistEntry:
-    signals = {s.signal_key: json.loads(s.signal_value) if s.signal_value else None
-               for s in signal_rows}
     return WatchlistEntry(
         ticker=row.ticker,
         total_score=row.total_score,
@@ -64,7 +62,7 @@ def _row_to_entry(row: ScanResult, signal_rows: list[StockSignals]) -> Watchlist
         archetype=row.archetype,
         regime=row.regime,
         timestamp=row.timestamp,
-        signals=signals,
+        signals=load_signals(signal_rows),
     )
 
 
