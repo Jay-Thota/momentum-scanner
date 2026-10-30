@@ -21,6 +21,7 @@
 #include "alloc_counter.h"
 #include "golden.h"
 #include "mscan/indicators.h"
+#include "mscan/layers.h"
 #include "mscan/streaming.h"
 #include "mscan/universe.h"
 
@@ -80,6 +81,71 @@ std::string first_mismatch(const mscan::BarSeries& bars, int roc_period, int obv
         return os.str();
       }
     }
+  }
+  return "";
+}
+
+// Every field of the two results, bit for bit; "" when they all match.
+std::string result_diff(const mscan::Layer1Result& a, const mscan::Layer1Result& b) {
+  std::ostringstream os;
+  os.precision(17);
+  auto f = [&](const char* name, double x, double y) {
+    if (!same(x, y)) os << " l1." << name << " " << x << " vs " << y;
+  };
+  f("score", a.score, b.score);
+  f("A", a.A, b.A); f("B", a.B, b.B); f("C", a.C, b.C); f("D", a.D, b.D); f("E", a.E, b.E);
+  f("vol_ratio", a.vol_ratio, b.vol_ratio);
+  f("up_down_ratio", a.up_down_ratio, b.up_down_ratio);
+  f("block_trades", a.block_trades, b.block_trades);
+  f("signals_fired", a.signals_fired, b.signals_fired);
+  f("valid", a.valid, b.valid);
+  return os.str();
+}
+
+std::string result_diff(const mscan::Layer2Result& a, const mscan::Layer2Result& b) {
+  std::ostringstream os;
+  os.precision(17);
+  auto f = [&](const char* name, double x, double y) {
+    if (!same(x, y)) os << " l2." << name << " " << x << " vs " << y;
+  };
+  f("archetype", a.archetype.value_or(0), b.archetype.value_or(0));
+  f("archetype_score", a.archetype_score, b.archetype_score);
+  f("momentum_score", a.momentum_score, b.momentum_score);
+  f("total", a.total, b.total);
+  f("mom_A", a.mom_A, b.mom_A); f("mom_B", a.mom_B, b.mom_B);
+  f("ma_pts", a.ma_pts, b.ma_pts);
+  f("roc10", a.roc10, b.roc10); f("adx", a.adx, b.adx);
+  f("di_p", a.di_p, b.di_p); f("di_n", a.di_n, b.di_n);
+  f("dist_days", a.dist_days, b.dist_days);
+  f("close_pct", a.close_pct, b.close_pct);
+  f("breakout_day", a.breakout_day, b.breakout_day);
+  f("breakout_pct", a.breakout_pct, b.breakout_pct);
+  f("breakout_vol_ratio", a.breakout_vol_ratio, b.breakout_vol_ratio);
+  f("valid", a.valid, b.valid);
+  return os.str();
+}
+
+// Streams `bars` and, at every `stride`-th bar, scores layers 1 and 2 from the
+// streamed snapshot and from the batch scorers on the same prefix. Returns
+// the first difference, or "". Also counts archetypes seen, so callers can
+// check the comparison exercised them.
+std::string first_score_mismatch(const mscan::BarSeries& bars, std::size_t stride,
+                                 std::size_t* archetypes_seen = nullptr) {
+  const mscan::ScoringConfig cfg;
+  ind::StreamingIndicators s(cfg.roc_period, cfg.obv_lookback_days);
+  for (std::size_t i = 0; i < bars.size(); ++i) {
+    s.update(bars.open[i], bars.high[i], bars.low[i], bars.close[i], bars.volume[i]);
+    if (i % stride != 0) continue;
+    const mscan::BarSeries prefix{bars.open.first(i + 1), bars.high.first(i + 1),
+                                  bars.low.first(i + 1), bars.close.first(i + 1),
+                                  bars.volume.first(i + 1)};
+    const auto snap = mscan::snapshot(s, cfg);
+    const auto l2 = mscan::score_layer2(prefix, std::nullopt, snap, cfg);
+    const std::string diff =
+        result_diff(mscan::score_layer1(prefix, 0, snap, cfg), mscan::score_layer1(prefix, 0, cfg)) +
+        result_diff(l2, mscan::score_layer2(prefix, std::nullopt, cfg));
+    if (!diff.empty()) return "bar " + std::to_string(i) + ":" + diff;
+    if (archetypes_seen && l2.archetype) ++*archetypes_seen;
   }
   return "";
 }
@@ -185,4 +251,31 @@ TEST(StreamingTest, UpdateNoHeapAllocation) {
   const long before = mscan_test::allocations();
   for (std::size_t i = 0; i < s.c.size(); ++i) st.update(s.o[i], s.h[i], s.l[i], s.c[i], s.v[i]);
   EXPECT_EQ(mscan_test::allocations() - before, 0) << "update allocated on the heap";
+}
+
+// Layers 1 and 2 from streamed snapshots == the batch scorers on the same
+// prefix, every field, at every bar of every golden series.
+TEST(StreamingScoresTest, MatchBatchOnGoldenSeries) {
+  std::size_t archetypes = 0;
+  for (const auto& g : mscan_test::goldens()) {
+    EXPECT_EQ(first_score_mismatch(mscan_test::bars_of(g), 1, &archetypes), "") << g.name;
+  }
+  EXPECT_GT(archetypes, 1000u) << "comparison never reached the archetype checks";
+}
+
+TEST(StreamingScoresTest, MatchBatchOnSyntheticSeries) {
+  for (unsigned seed = 1; seed <= 5; ++seed) {
+    const Synthetic s = synthetic(400, seed);
+    EXPECT_EQ(first_score_mismatch(s.bars(), 1), "") << "seed " << seed;
+  }
+}
+
+// Every 100th ticker of the real file, every day (the goldens cover every bar).
+TEST(StreamingScoresTest, MatchBatchOnRealUniverse) {
+  const std::string path = std::string(MSCAN_ENGINE_DIR) + "/data/history.bin";
+  if (!std::filesystem::exists(path)) GTEST_SKIP() << "no " << path;
+  const auto u = mscan::Universe::open_mmap(path);
+  for (std::size_t i = 0; i < u.num_tickers(); i += 100) {
+    EXPECT_EQ(first_score_mismatch(u.series(i, u.num_days() - 1), 1), "") << u.ticker(i);
+  }
 }

@@ -5,8 +5,10 @@
 // branches here as it does there. Reported values are rounded the way Python
 // rounds them (py_round for Python floats, np_round for numpy.float64).
 //
-// Unlike the indicator kernels, these functions allocate: they compute full
-// indicator series into local vectors, exactly as layer2._add_indicators does.
+// The batch overloads compute full indicator series into local vectors,
+// exactly as layer2._add_indicators does, and pass the newest values on as an
+// IndicatorSnapshot. The snapshot overloads take those values from
+// StreamingIndicators instead. Everything after that is one shared code path.
 
 #include "mscan/layers.h"
 
@@ -19,6 +21,7 @@
 
 #include "mscan/indicators.h"
 #include "mscan/pyround.h"
+#include "mscan/streaming.h"
 
 namespace mscan {
 namespace {
@@ -67,43 +70,45 @@ std::span<const double> last(std::span<const double> x, std::size_t k) {
   return x.subspan(x.size() - std::min(k, x.size()));
 }
 
-struct Indicators {
-  std::vector<double> ma20, ma50, ma200, roc, adx, di_p, di_n;
-};
+// x[n - 1 - k], NaN when the series is too short
+double back(const std::vector<double>& x, std::size_t k) {
+  return k < x.size() ? x[x.size() - 1 - k] : kNaN;
+}
 
-// layer2._add_indicators
-Indicators add_indicators(const BarSeries& bars, const ScoringConfig& cfg) {
+// layer2._add_indicators, reduced to the values the layer 2 checks read
+IndicatorSnapshot layer2_snapshot(const BarSeries& bars, const ScoringConfig& cfg) {
   const std::size_t n = bars.size();
-  Indicators ind{std::vector<double>(n), std::vector<double>(n), std::vector<double>(n),
-                 std::vector<double>(n), std::vector<double>(n), std::vector<double>(n),
-                 std::vector<double>(n)};
-  ind::sma(bars.close, 20, ind.ma20);
-  ind::sma(bars.close, 50, ind.ma50);
-  ind::sma(bars.close, 200, ind.ma200);
-  ind::roc(bars.close, cfg.roc_period, ind.roc);
-  ind::adx(bars, kAdxPeriod, {ind.adx, ind.di_p, ind.di_n});
-  return ind;
+  std::vector<double> ma20(n), ma50(n), ma200(n), roc(n), adx(n), di_p(n), di_n(n);
+  ind::sma(bars.close, 20, ma20);
+  ind::sma(bars.close, 50, ma50);
+  ind::sma(bars.close, 200, ma200);
+  ind::roc(bars.close, cfg.roc_period, roc);
+  ind::adx(bars, kAdxPeriod, {adx, di_p, di_n});
+  const auto slope = static_cast<std::size_t>(cfg.ma_slope_lookback);
+  const auto cross = static_cast<std::size_t>(cfg.golden_cross_lookback);
+  return {back(ma20, 0), back(ma50, 0), back(ma200, 0),
+          back(ma50, slope), back(ma200, slope), back(ma50, cross), back(ma200, cross),
+          back(roc, 0), back(adx, 0), back(di_p, 0), back(di_n, 0),
+          kNaN, kNaN};   // OBV is layer 1's
 }
 
 // _arch1_uptrend
-bool arch1_uptrend(const BarSeries& bars, const Indicators& ind, const ScoringConfig& cfg) {
+bool arch1_uptrend(const BarSeries& bars, const IndicatorSnapshot& ind, const ScoringConfig& cfg) {
   const std::size_t n = bars.size();
-  const double ma50 = ind.ma50[n - 1], ma200 = ind.ma200[n - 1], close = bars.close[n - 1];
-  if (std::isnan(ma50) || std::isnan(ma200)) return false;
-  if (close <= ma50 || close <= ma200) return false;   // a NaN close passes, as in Python
-  const auto lb = static_cast<std::size_t>(cfg.ma_slope_lookback);
-  if (n <= lb) return false;
-  return ind.ma50[n - 1] > ind.ma50[n - 1 - lb] && ind.ma200[n - 1] > ind.ma200[n - 1 - lb];
+  const double close = bars.close[n - 1];
+  if (std::isnan(ind.ma50) || std::isnan(ind.ma200)) return false;
+  if (close <= ind.ma50 || close <= ind.ma200) return false;   // a NaN close passes, as in Python
+  if (n <= static_cast<std::size_t>(cfg.ma_slope_lookback)) return false;
+  return ind.ma50 > ind.ma50_slope_ago && ind.ma200 > ind.ma200_slope_ago;
 }
 
 // _arch2_early_recovery
-bool arch2_golden_cross(const BarSeries& bars, const Indicators& ind, const ScoringConfig& cfg) {
+bool arch2_golden_cross(const BarSeries& bars, const IndicatorSnapshot& ind, const ScoringConfig& cfg) {
   const std::size_t n = bars.size();
-  const auto lb = static_cast<std::size_t>(cfg.golden_cross_lookback);
-  if (n < lb + 2) return false;
-  if (std::isnan(ind.ma50[n - 1]) || std::isnan(ind.ma200[n - 1])) return false;
-  const bool cross_now = ind.ma50[n - 1] > ind.ma200[n - 1];
-  const bool cross_then = ind.ma50[n - 1 - lb] < ind.ma200[n - 1 - lb];
+  if (n < static_cast<std::size_t>(cfg.golden_cross_lookback) + 2) return false;
+  if (std::isnan(ind.ma50) || std::isnan(ind.ma200)) return false;
+  const bool cross_now = ind.ma50 > ind.ma200;
+  const bool cross_then = ind.ma50_cross_ago < ind.ma200_cross_ago;
   return cross_now && cross_then;
 }
 
@@ -153,11 +158,10 @@ bool arch4_sector_rotation(const std::optional<SectorContext>& sector) {
 }
 
 // _momentum_score
-double momentum(const BarSeries& bars, const Indicators& ind, const ScoringConfig& cfg,
+double momentum(const BarSeries& bars, const IndicatorSnapshot& ind, const ScoringConfig& cfg,
                 Layer2Result& r) {
   const std::size_t n = bars.size();
-  const double roc10 = ind.roc[n - 1], adx = ind.adx[n - 1];
-  const double di_p = ind.di_p[n - 1], di_n = ind.di_n[n - 1];
+  const double roc10 = ind.roc, adx = ind.adx, di_p = ind.di_p, di_n = ind.di_n;
 
   // Signal A
   const bool any_nan = std::isnan(roc10) || std::isnan(adx) || std::isnan(di_p) || std::isnan(di_n);
@@ -176,7 +180,7 @@ double momentum(const BarSeries& bars, const Indicators& ind, const ScoringConfi
   // Signal C: bonus per moving average the close is above
   const double price = bars.close[n - 1];
   double ma_pts = 0.0;
-  for (double ma : {ind.ma20[n - 1], ind.ma50[n - 1], ind.ma200[n - 1]}) {
+  for (double ma : {ind.ma20, ind.ma50, ind.ma200}) {
     if (!std::isnan(ma) && price > ma) ma_pts += cfg.ma_bonus_per_level;
   }
 
@@ -196,7 +200,28 @@ double momentum(const BarSeries& bars, const Indicators& ind, const ScoringConfi
 
 }  // namespace
 
+IndicatorSnapshot snapshot(const ind::StreamingIndicators& s, const ScoringConfig& cfg) {
+  const auto slope = static_cast<std::size_t>(cfg.ma_slope_lookback);
+  const auto cross = static_cast<std::size_t>(cfg.golden_cross_lookback);
+  return {s.sma20(), s.sma50(), s.sma200(),
+          s.sma50_ago(slope), s.sma200_ago(slope), s.sma50_ago(cross), s.sma200_ago(cross),
+          s.roc(), s.adx(), s.plus_di(), s.minus_di(),
+          s.obv(), s.obv_high()};
+}
+
 Layer1Result score_layer1(const BarSeries& bars, int block_trades, const ScoringConfig& cfg) {
+  const auto lookback = static_cast<std::size_t>(cfg.obv_lookback_days);
+  if (bars.size() < lookback + 2) return score_layer1(bars, block_trades, IndicatorSnapshot{}, cfg);
+  std::vector<double> obv(bars.size());
+  ind::obv(bars.close, bars.volume, obv);
+  IndicatorSnapshot snap{};
+  snap.obv = obv.back();
+  snap.obv_high = nan_max(last(obv, lookback));
+  return score_layer1(bars, block_trades, snap, cfg);
+}
+
+Layer1Result score_layer1(const BarSeries& bars, int block_trades, const IndicatorSnapshot& ind,
+                          const ScoringConfig& cfg) {
   Layer1Result r;
   r.block_trades = block_trades;
   const auto lookback = static_cast<std::size_t>(cfg.obv_lookback_days);
@@ -222,9 +247,7 @@ Layer1Result score_layer1(const BarSeries& bars, int block_trades, const Scoring
   r.C = up_down > cfg.up_down_vol_ratio_min;
 
   // OBV at or above its 20-bar high
-  std::vector<double> obv(n);
-  ind::obv(bars.close, bars.volume, obv);
-  r.D = obv[n - 1] >= nan_max(last(obv, lookback));
+  r.D = ind.obv >= ind.obv_high;
 
   r.E = block_trades > 0;
   r.signals_fired = int(r.A) + int(r.B) + int(r.C) + int(r.D) + int(r.E);
@@ -237,11 +260,16 @@ Layer1Result score_layer1(const BarSeries& bars, int block_trades, const Scoring
 
 Layer2Result score_layer2(const BarSeries& bars, const std::optional<SectorContext>& sector,
                           const ScoringConfig& cfg) {
+  if (bars.size() < kL2MinRows) return Layer2Result{};   // Python's _empty
+  return score_layer2(bars, sector, layer2_snapshot(bars, cfg), cfg);
+}
+
+Layer2Result score_layer2(const BarSeries& bars, const std::optional<SectorContext>& sector,
+                          const IndicatorSnapshot& ind, const ScoringConfig& cfg) {
   Layer2Result r;
   const std::size_t n = bars.size();
   if (n < kL2MinRows) return r;   // Python's _empty
 
-  const Indicators ind = add_indicators(bars, cfg);
   const double avg_vol_20d = nan_mean(bars.volume.subspan(n - 21, 20));   // iloc[-21:-1]
 
   // Archetype: first match wins
