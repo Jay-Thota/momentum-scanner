@@ -8,21 +8,25 @@
 // 2.68), so each reported field must use the same one Python uses.
 // tests/rounding_test.cpp checks both against tests/golden/rounding.csv.
 
+#include <charconv>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 
 namespace mscan {
 
 // round(x, ndigits) on a Python float. CPython formats the correctly rounded
-// decimal with dtoa and parses it back; printf("%.*f") + strtod do the same
-// with a correctly rounding libc. A 512-byte stack buffer fits any double at
-// up to 6 decimals (the largest is ~310 digits), so this never allocates.
+// decimal with dtoa and parses it back. std::to_chars and std::from_chars do
+// the same: the standard defines them as printf("%.*f") and strtod in the "C"
+// locale, both correctly rounded. Unlike snprintf/strtod they never touch the
+// global locale, whose shared state made threads contend (8 threads ran
+// slower than 1). A 512-byte stack buffer fits any double at up to 6
+// decimals (the largest is ~310 digits), so this never allocates.
 inline double py_round(double x, int ndigits) {
   if (!std::isfinite(x)) return x;
   char buf[512];
-  std::snprintf(buf, sizeof buf, "%.*f", ndigits, x);
-  return std::strtod(buf, nullptr);
+  const char* end = std::to_chars(buf, buf + sizeof buf, x, std::chars_format::fixed, ndigits).ptr;
+  double out = 0.0;
+  std::from_chars(buf, end, out);
+  return out;
 }
 
 // round(x, ndigits) on a numpy.float64: multiply by 10^n, round half to even
