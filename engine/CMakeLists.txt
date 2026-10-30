@@ -26,6 +26,7 @@ add_library(mscan_core STATIC
   src/indicators.cpp
   src/layers.cpp
   src/thread_pool.cpp
+  src/streaming.cpp
   src/backtest.cpp)
 target_include_directories(mscan_core PUBLIC include)
 target_compile_options(mscan_core PRIVATE -Wall -Wextra -Wpedantic -Werror
@@ -49,6 +50,7 @@ if(MSCAN_BUILD_TESTS)
   add_executable(mscan_tests
     tests/universe_test.cpp       # mmap loader: bad magic, truncation, NaN left-padding
     tests/indicators_test.cpp     # hand-computed small cases + NaN warm-up
+    tests/streaming_test.cpp      # StreamingIndicators vs the batch kernels
     tests/rounding_test.cpp       # py_round / np_round vs Python
     tests/parity_test.cpp         # vs. golden CSVs dumped from the Python layers
     tests/thread_pool_test.cpp
