@@ -102,6 +102,67 @@ def panel_frames(sessions: int | None) -> dict[str, pd.DataFrame]:
     return out
 
 
+def alpaca_raw_bars(frames: dict[str, pd.DataFrame]) -> dict[str, list[dict]]:
+    """
+    Each frame as the Alpaca bars API returns it with raw_data=True: dicts with
+    an ISO "t" at midnight ET in UTC and an integer "v" (the frame's volume as
+    the raw IEX count; both paths then apply ALPACA_IEX_VOLUME_MULTIPLIER).
+    """
+    out = {}
+    for t, df in frames.items():
+        utc = pd.DatetimeIndex(df.index).tz_localize("America/New_York").tz_convert("UTC")
+        stamps = utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        out[t] = [{"c": c, "h": h, "l": lo, "n": 0, "o": o, "t": s, "v": int(v), "vw": c}
+                  for s, o, h, lo, c, v in zip(stamps, df["Open"], df["High"], df["Low"],
+                                               df["Close"], df["Volume"])]
+    return out
+
+
+def run_alpaca_arrays(name: str, frames: dict[str, pd.DataFrame], fallback: dict[str, pd.DataFrame]) -> bool:
+    """
+    USE_CPP_ENGINE's Step 1-4 data path vs the original, from the same API
+    response: raw JSON bars -> OhlcvBatch (+ Yahoo fallback merged in) vs
+    alpaca-py Bar models built from that JSON -> DataFrames (+ the same
+    fallback). Checks the rebuilt DataFrames, Step 2's tickers and Step 4.
+    """
+    from alpaca.data.models import Bar
+
+    from backend.data.fetcher_price import bars_to_frame
+    from backend.data.ohlcv_batch import LazyOhlcvMap, OhlcvBatch
+    from backend.scoring.scorer import l0_price_volume_pass
+
+    raw = alpaca_raw_bars(frames)
+    tickers = sorted(set(raw) | set(fallback))
+    old = {t: bars_to_frame([Bar(t, d) for d in rows]) for t, rows in raw.items()}
+    old.update(fallback)
+    t0 = time.perf_counter()
+    lazy = LazyOhlcvMap(OhlcvBatch.from_raw_bars(raw, list(raw)))
+    lazy.update(fallback)
+    t_build = time.perf_counter() - t0
+
+    diffs: list[str] = []
+    pv_old, pv_new = l0_price_volume_pass(tickers, old), l0_price_volume_pass(tickers, lazy)
+    if pv_old != pv_new:
+        diffs.append(f"Step 2 differs: {len(pv_old)} vs {len(pv_new)} tickers, "
+                     f"e.g. {sorted(set(pv_old) ^ set(pv_new))[:5]}")
+    py = score_l1l2(tickers, old, use_cpp=False)
+    cpp = score_l1l2(tickers, lazy, use_cpp=True)
+    for t in tickers:
+        compare(py[t], cpp[t], t, diffs)
+    for t in tickers:                       # rebuilt frames, checked last (builds them all)
+        try:
+            pd.testing.assert_frame_equal(lazy[t], old[t], check_exact=True)
+        except AssertionError as exc:
+            diffs.append(f"{t}: rebuilt DataFrame differs: {str(exc).splitlines()[0]}")
+
+    status = "[PASS]" if not diffs else "[FAIL]"
+    print(f"  {status}  {name}: {len(tickers)} tickers ({len(fallback)} via fallback), "
+          f"{len(diffs)} differences  (bars -> arrays {t_build:.2f}s, step 2 pass {len(pv_new)})")
+    for d in diffs[:10]:
+        print(f"           {d}")
+    return not diffs
+
+
 def _is_bool(x) -> bool:
     return isinstance(x, (bool, np.bool_))
 
@@ -157,9 +218,15 @@ def main() -> None:
     g = golden_frames()
     ok = run("golden series", g)
     ok &= run("edge cases", edge_frames(g))
+    # Yahoo-style fallback rows: tz-naive daily index, longer than the Alpaca rows
+    fallback = {f"YH_{k}": g[k] for k in ("AAPL", "ADBE__to2024-06-18", "SATS")}
+    ok &= run_alpaca_arrays("alpaca bars -> arrays, golden series", g, fallback)
     if PANEL.exists():
-        ok &= run(f"real universe, last {PRODUCTION_SESSIONS} sessions", panel_frames(PRODUCTION_SESSIONS))
+        prod = panel_frames(PRODUCTION_SESSIONS)
+        ok &= run(f"real universe, last {PRODUCTION_SESSIONS} sessions", prod)
         ok &= run("real universe, full history", panel_frames(None))
+        ok &= run_alpaca_arrays(f"alpaca bars -> arrays, real universe ({PRODUCTION_SESSIONS} sessions)",
+                                prod, fallback)
     else:
         print(f"  [SKIP]  real universe: {PANEL} not found (python -m scripts.export_history)")
     print(f"\n{SEP}\n  {'ALL PASSED' if ok else 'FAILURES ABOVE'}\n{SEP}\n")

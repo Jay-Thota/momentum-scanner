@@ -6,7 +6,7 @@
 //       tickers,            # list[str], length T
 //       open, high, low, close, volume,   # np.float64 arrays, shape (T, D), C-contiguous
 //       cfg_dict,           # live values from backend.config (UPPER_CASE keys)
-//       num_threads=1,      # phase 3 is single-threaded; the pool lands in phase 4
+//       num_threads=1,      # 1 scores on the calling thread; more uses a ThreadPool
 //       dates=None)         # optional int64 (T, D) YYYYMMDD, 0 for padding
 //   -> list[{"l1": dict, "l2": dict}] in the exact shape layer1.score() /
 //      layer2.score() return today (sector ETF empty, rs_rank None,
@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "mscan/layers.h"
+#include "mscan/thread_pool.h"
 #include "mscan/universe.h"
 
 namespace py = pybind11;
@@ -139,9 +140,7 @@ py::list score_l1l2_batch(std::vector<std::string> tickers,
                           F64Array close, F64Array volume,
                           const py::dict& cfg_dict, std::size_t num_threads,
                           std::optional<I64Array> dates) {
-  if (num_threads != 1) {
-    throw std::invalid_argument("num_threads must be 1 until the thread pool lands (phase 4)");
-  }
+  if (num_threads < 1) throw std::invalid_argument("num_threads must be >= 1");
   if (open.ndim() != 2) throw std::invalid_argument("open must be a 2-D (T, D) array");
   const py::ssize_t t = open.shape(0), d = open.shape(1);
   if (static_cast<std::size_t>(t) != tickers.size()) {
@@ -166,11 +165,21 @@ py::list score_l1l2_batch(std::vector<std::string> tickers,
     py::gil_scoped_release no_gil;   // nothing below touches a Python object
     // The calendar is unused here (dates come from `dates`), so it is zeros.
     Universe u = Universe::from_buffers(std::move(tickers), std::vector<int32_t>(days, 0), o, h, lo, c, v);
-    for (std::size_t i = 0; i < num; ++i) {
-      first[i] = u.first_valid_day(i);
-      const BarSeries s = days == 0 ? BarSeries{} : u.series(i, days - 1);
-      l1[i] = score_layer1(s, /*block_trades=*/0, cfg);
-      l2[i] = score_layer2(s, std::nullopt, cfg);
+    // Each index writes only its own slots of first/l1/l2, so chunks never
+    // share data and need no locking.
+    auto score_rows = [&](std::size_t begin, std::size_t end) {
+      for (std::size_t i = begin; i < end; ++i) {
+        first[i] = u.first_valid_day(i);
+        const BarSeries s = days == 0 ? BarSeries{} : u.series(i, days - 1);
+        l1[i] = score_layer1(s, /*block_trades=*/0, cfg);
+        l2[i] = score_layer2(s, std::nullopt, cfg);
+      }
+    };
+    if (num_threads == 1) {
+      score_rows(0, num);
+    } else {
+      ThreadPool pool(num_threads);
+      pool.parallel_for(num, score_rows);
     }
   }
 

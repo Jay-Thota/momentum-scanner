@@ -102,6 +102,26 @@ def fetch_intraday_block_trades(ticker: str, min_size: int | None = None) -> int
         return 0
 
 
+def bars_to_frame(bar_list: list) -> pd.DataFrame:
+    """One ticker's Alpaca bars -> OHLCV DataFrame with OBV (empty if no bars)."""
+    if not bar_list:
+        return pd.DataFrame()
+    df = pd.DataFrame({
+        "Open":   [float(b.open)   for b in bar_list],
+        "High":   [float(b.high)   for b in bar_list],
+        "Low":    [float(b.low)    for b in bar_list],
+        "Close":  [float(b.close)  for b in bar_list],
+        # IEX captures ~2-3% of consolidated tape; scale up so that
+        # volume thresholds (MIN_AVG_VOLUME, RVOL) remain calibrated.
+        "Volume": [float(b.volume) * config.ALPACA_IEX_VOLUME_MULTIPLIER
+                   for b in bar_list],
+    })
+    df.index = pd.DatetimeIndex([b.timestamp for b in bar_list])
+    df.sort_index(inplace=True)
+    df["OBV"] = _compute_obv(df)
+    return df
+
+
 def fetch_daily_ohlcv_batch_alpaca(
     tickers: list[str],
     lookback_days: int = 300,
@@ -116,6 +136,25 @@ def fetch_daily_ohlcv_batch_alpaca(
     return data for -- the caller should fall back to Yahoo for those.
     Returns an empty dict if Alpaca is not configured.
     """
+    bars = fetch_daily_bars_alpaca(tickers, lookback_days, chunk_size)
+    return {t: bars_to_frame(b) for t, b in bars.items()}
+
+
+def fetch_daily_bars_alpaca(
+    tickers: list[str],
+    lookback_days: int = 300,
+    chunk_size: int = 200,
+    raw: bool = False,
+) -> dict[str, list]:
+    """
+    The Alpaca IEX daily bars behind fetch_daily_ohlcv_batch_alpaca:
+    {ticker: [Bar, ...]}, an empty list for tickers with no data or in a
+    failed chunk. Returns an empty dict if Alpaca is not configured.
+
+    raw=True returns the API's JSON dicts ({"t", "o", "h", "l", "c", "v", ...})
+    instead of alpaca-py Bar models; building the models takes ~3 s for the
+    full universe.
+    """
     if not (config.ALPACA_API_KEY and config.ALPACA_SECRET_KEY):
         logger.info("Alpaca keys not configured -- batch OHLCV unavailable")
         return {}
@@ -128,11 +167,11 @@ def fetch_daily_ohlcv_batch_alpaca(
         logger.warning("alpaca-py not installed -- batch OHLCV unavailable")
         return {}
 
-    client   = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
+    client   = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, raw_data=raw)
     start_dt = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     end_dt   = datetime.now(timezone.utc)
 
-    result: dict[str, pd.DataFrame] = {}
+    result: dict[str, list] = {}
 
     for offset in range(0, len(tickers), chunk_size):
         chunk = tickers[offset : offset + chunk_size]
@@ -145,29 +184,12 @@ def fetch_daily_ohlcv_batch_alpaca(
                 feed="iex",
             )
             bars = client.get_stock_bars(req)
+            by_symbol = bars if raw else bars.data   # raw: {symbol: [dict, ...]}
 
             for ticker in chunk:
-                bar_list = bars.data.get(ticker) or []
-                if not bar_list:
-                    result[ticker] = pd.DataFrame()
-                    continue
+                result[ticker] = by_symbol.get(ticker) or []
 
-                df = pd.DataFrame({
-                    "Open":   [float(b.open)   for b in bar_list],
-                    "High":   [float(b.high)   for b in bar_list],
-                    "Low":    [float(b.low)    for b in bar_list],
-                    "Close":  [float(b.close)  for b in bar_list],
-                    # IEX captures ~2-3% of consolidated tape; scale up so that
-                    # volume thresholds (MIN_AVG_VOLUME, RVOL) remain calibrated.
-                    "Volume": [float(b.volume) * config.ALPACA_IEX_VOLUME_MULTIPLIER
-                               for b in bar_list],
-                })
-                df.index = pd.DatetimeIndex([b.timestamp for b in bar_list])
-                df.sort_index(inplace=True)
-                df["OBV"] = _compute_obv(df)
-                result[ticker] = df
-
-            have = sum(1 for t in chunk if not result.get(t, pd.DataFrame()).empty)
+            have = sum(1 for t in chunk if result[t])
             logger.info(
                 "Alpaca batch %d-%d: %d/%d tickers returned data",
                 offset, offset + len(chunk), have, len(chunk),
@@ -180,7 +202,7 @@ def fetch_daily_ohlcv_batch_alpaca(
             )
             for t in chunk:
                 if t not in result:
-                    result[t] = pd.DataFrame()
+                    result[t] = []
 
     return result
 

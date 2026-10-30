@@ -22,6 +22,7 @@ Public API:
 import json
 import logging
 import time
+from collections.abc import Mapping, MutableMapping
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait as futures_wait
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
@@ -33,9 +34,11 @@ from backend import config
 from backend.data.fetcher_options import batch_upsert_options, fetch_options_signals, fetch_vwap
 from backend.data.fetcher_price import (
     fetch_batch,
+    fetch_daily_bars_alpaca,
     fetch_daily_ohlcv,
     fetch_daily_ohlcv_batch_alpaca,
 )
+from backend.data.ohlcv_batch import LazyOhlcvMap, OhlcvBatch
 from backend.data.fetcher_sector import (
     SECTOR_PEERS,
     build_sector_returns,
@@ -58,6 +61,8 @@ from backend.universe import get_universe
 from backend.utils.regime_filter import get_regime
 
 logger = logging.getLogger(__name__)
+
+_L0_VOLUME_WINDOW = 20   # Step 2: bars required, and the average-volume window
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +196,45 @@ def score_stock(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def fetch_ohlcv_map(universe: list[str]) -> MutableMapping[str, pd.DataFrame]:
+    """
+    Step 1: Alpaca daily bars as a {ticker: DataFrame} mapping. With
+    USE_CPP_ENGINE the bars go straight into (T, D) arrays for the engine and
+    a DataFrame is only built when a later step asks for that ticker.
+    """
+    if config.USE_CPP_ENGINE:
+        raw = fetch_daily_bars_alpaca(universe, raw=True)
+        return LazyOhlcvMap(OhlcvBatch.from_raw_bars(raw, list(raw)))
+    return fetch_daily_ohlcv_batch_alpaca(universe)
+
+
+def _n_rows(ohlcv_map: Mapping[str, pd.DataFrame], ticker: str) -> int:
+    if isinstance(ohlcv_map, LazyOhlcvMap):
+        return ohlcv_map.n_rows(ticker)   # without building the DataFrame
+    return len(ohlcv_map.get(ticker, pd.DataFrame()))
+
+
+def l0_price_volume_pass(tickers: list[str], ohlcv_map: Mapping[str, pd.DataFrame]) -> list[str]:
+    """Step 2: tickers with >= 20 bars, last close >= MIN_PRICE and 20-bar avg volume >= MIN_AVG_VOLUME."""
+    if isinstance(ohlcv_map, LazyOhlcvMap):
+        known = [t for t in tickers if t in ohlcv_map.batch.row]
+        close, avg = ohlcv_map.batch.last_close_and_avg_volume(known, _L0_VOLUME_WINDOW)
+        passed = {t for t, c, a in zip(known, close, avg)
+                  if c >= config.MIN_PRICE and a >= config.MIN_AVG_VOLUME}
+        return [t for t in tickers if t in passed]
+
+    out: list[str] = []
+    for ticker in tickers:
+        df = ohlcv_map.get(ticker, pd.DataFrame())
+        if df.empty or len(df) < _L0_VOLUME_WINDOW:
+            continue
+        price   = float(df["Close"].iloc[-1])
+        avg_vol = float(df["Volume"].tail(_L0_VOLUME_WINDOW).mean())
+        if price >= config.MIN_PRICE and avg_vol >= config.MIN_AVG_VOLUME:
+            out.append(ticker)
+    return out
+
+
 def _score_l1l2_python(tickers: list[str], ohlcv_map: dict[str, pd.DataFrame]) -> dict[str, dict]:
     l1l2_map: dict[str, dict] = {}
     for ticker in tickers:
@@ -280,9 +324,9 @@ def run_daily_scan(stats: dict | None = None) -> list["ScoringResult"]:
 
     # ── Step 1: Alpaca batch OHLCV ─────────────────────────────────────────
     logger.info("Step 1: Alpaca batch OHLCV for %d tickers ...", len(universe))
-    ohlcv_map: dict[str, pd.DataFrame] = fetch_daily_ohlcv_batch_alpaca(universe)
+    ohlcv_map = fetch_ohlcv_map(universe)
 
-    alpaca_hit    = [t for t in universe if not ohlcv_map.get(t, pd.DataFrame()).empty]
+    alpaca_hit    = [t for t in universe if _n_rows(ohlcv_map, t) > 0]
     yahoo_missing = [t for t in universe if t not in alpaca_hit]
 
     logger.info(
@@ -295,20 +339,11 @@ def run_daily_scan(stats: dict | None = None) -> list["ScoringResult"]:
         fallback = fetch_batch(yahoo_missing, workers=5)
         ohlcv_map.update(fallback)
 
-    total_with_data = sum(1 for df in ohlcv_map.values() if not df.empty)
+    total_with_data = sum(1 for t in ohlcv_map if _n_rows(ohlcv_map, t) > 0)
     logger.info("  Total tickers with OHLCV: %d", total_with_data)
 
     # ── Step 2: L0 price + volume (no Yahoo) ───────────────────────────────
-    l0_pv_pass: list[str] = []
-    for ticker in universe:
-        df = ohlcv_map.get(ticker, pd.DataFrame())
-        if df.empty or len(df) < 20:
-            continue
-        price   = float(df["Close"].iloc[-1])
-        avg_vol = float(df["Volume"].tail(20).mean())
-        if price >= config.MIN_PRICE and avg_vol >= config.MIN_AVG_VOLUME:
-            l0_pv_pass.append(ticker)
-
+    l0_pv_pass = l0_price_volume_pass(universe, ohlcv_map)
     logger.info("Step 2: L0 price+vol pass: %d/%d", len(l0_pv_pass), len(universe))
 
     # ── Step 3: Sector ETF pre-fetch (11 Yahoo ETF calls, in parallel) ─────
