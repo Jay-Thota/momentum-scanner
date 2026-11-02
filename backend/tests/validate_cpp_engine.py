@@ -211,6 +211,34 @@ def run(name: str, frames: dict[str, pd.DataFrame]) -> bool:
     return not diffs
 
 
+def run_shadow(frames: dict[str, pd.DataFrame]) -> bool:
+    """
+    CPP_ENGINE_SHADOW (what a deployment uses to verify itself): 0 differences
+    on matching results, and a one-ULP change in one C++ value is caught.
+    """
+    from unittest.mock import patch
+
+    from backend.scoring import scorer
+    from backend.scoring.cpp_engine import score_l1l2_cpp
+
+    tickers = list(frames)
+    cpp = score_l1l2_cpp(tickers, frames)
+    clean = scorer._shadow_check(tickers, frames, cpp)
+    victim = next(t for t in tickers if cpp[t]["l1"]["signals"].get("vol_ratio"))
+    sig = cpp[victim]["l1"]["signals"]
+    sig["vol_ratio"] = math.nextafter(sig["vol_ratio"], math.inf)
+    tampered = scorer._shadow_check(tickers, frames, cpp)
+    # And through score_l1l2 itself with both flags on
+    with patch.object(scorer.config, "USE_CPP_ENGINE", True), \
+         patch.object(scorer.config, "CPP_ENGINE_SHADOW", True), \
+         patch.object(scorer, "_shadow_check", wraps=scorer._shadow_check) as spy:
+        scorer.score_l1l2(tickers, frames)
+    ok = clean == 0 and tampered == 1 and spy.call_count == 1
+    print(f"  {'[PASS]' if ok else '[FAIL]'}  shadow check: {clean} differences when equal, "
+          f"{tampered} after a 1-ULP change to {victim}, ran {spy.call_count}x inside score_l1l2")
+    return ok
+
+
 def main() -> None:
     import mscan_engine  # noqa: F401  -- fail fast with ImportError if not built
 
@@ -221,6 +249,7 @@ def main() -> None:
     # Yahoo-style fallback rows: tz-naive daily index, longer than the Alpaca rows
     fallback = {f"YH_{k}": g[k] for k in ("AAPL", "ADBE__to2024-06-18", "SATS")}
     ok &= run_alpaca_arrays("alpaca bars -> arrays, golden series", g, fallback)
+    ok &= run_shadow(g)
     if PANEL.exists():
         prod = panel_frames(PRODUCTION_SESSIONS)
         ok &= run(f"real universe, last {PRODUCTION_SESSIONS} sessions", prod)
