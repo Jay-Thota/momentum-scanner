@@ -1,0 +1,65 @@
+name: engine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpp:
+    name: C++ ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: tests
+            flags: ""
+          - name: asan + ubsan
+            flags: -DMSCAN_SANITIZE=ON
+          - name: tsan
+            flags: -DMSCAN_TSAN=ON
+    env:
+      # LeakSanitizer runs as part of ASan on Linux; fail on the first report
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+      UBSAN_OPTIONS: print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@v4
+      # TSan's shadow memory layout breaks with the runner kernel's default
+      # 32 bits of mmap randomization ("unexpected memory mapping")
+      - name: Reduce ASLR entropy for TSan
+        if: matrix.name == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake -S engine -B engine/build -DMSCAN_PYTHON=OFF ${{ matrix.flags }}
+      - name: Build
+        run: cmake --build engine/build -j 4
+      # history.bin is not in git, so the real-universe tests skip; the
+      # goldens in engine/tests/golden cover parity
+      - name: Test
+        run: ctest --test-dir engine/build --output-on-failure
+
+  python-parity:
+    name: Python parity (production pins)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # runtime.txt / Dockerfile
+          cache: pip
+      - name: Install requirements and the engine
+        run: |
+          pip install -r requirements.txt
+          pip install ./engine
+      - name: Python vs C++ Step 4 (goldens and edge cases)
+        run: python -m backend.tests.validate_cpp_engine
+      - name: API signal normalization
+        run: python -m backend.tests.validate_api_signals
+      - name: Universe refresh fallback
+        run: python -m backend.tests.validate_universe_fallback
