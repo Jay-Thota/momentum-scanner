@@ -12,8 +12,10 @@ option(MSCAN_PYTHON "Build pybind11 module" ON)
 option(MSCAN_BUILD_TESTS "Build tests and benchmarks" ON)
 
 if(MSCAN_SANITIZE)
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=address,undefined)
+  # -fno-sanitize-recover: UBSan aborts on the first error instead of printing
+  # it and carrying on, so a CI test run fails on undefined behavior
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined -fno-sanitize-recover=all)
 endif()
 if(MSCAN_TSAN)
   add_compile_options(-fsanitize=thread)
