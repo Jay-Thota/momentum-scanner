@@ -37,7 +37,7 @@ until the current validation script passes.
 - Use ThreadPoolExecutor for all batch data fetching (15 workers max)
 - Log reasons when Layer 0 rejects a ticker and when Layer 4 hard-disqualifies
 
-## C++ engine (engine/) -- in progress
+## C++ engine (engine/)
 C++20 library + pybind11 module `mscan_engine`. Replaces the Step 4 L1+L2 loop in
 scorer.py (pure OHLCV, no network) and powers a historical backtester. Python keeps
 fetching, L0 mcap/earnings, L3, L4, L5, API, DB, alerts, scheduler.
@@ -64,6 +64,14 @@ fetching, L0 mcap/earnings, L3, L4, L5, API, DB, alerts, scheduler.
 - Python module: venv/bin/pip install -e engine (rerun after C++ changes); enable with USE_CPP_ENGINE=true
 - Step 4 parity (Python vs C++): python -m backend.tests.validate_cpp_engine
 - Step 4 timing: python -m scripts.bench_step4
+- Backtest: python -m scripts.run_backtest (needs engine/data/history.bin); picks vs the
+  Python scan code: python -m backend.tests.validate_backtest
+- Production check: CPP_ENGINE_SHADOW=true (with USE_CPP_ENGINE) logs Python-vs-C++
+  Step 4 differences on live data
+- CI: .github/workflows/engine.yml (C++ tests, ASan+UBSan with leak checks, TSan, Python
+  parity on the requirements.txt pins). The production image is the Dockerfile; local
+  parity on the pinned stack: docker build -t mscan . && docker run --rm
+  -v $PWD/engine/data:/app/engine/data:ro mscan python -m backend.tests.validate_cpp_engine
 - Tests: ctest --test-dir engine/build
 - Sanitizers: add -DMSCAN_SANITIZE=ON (ASan+UBSan) or -DMSCAN_TSAN=ON, in their own
   build dirs (engine/build-asan, engine/build-tsan) with -DMSCAN_PYTHON=OFF
@@ -88,4 +96,4 @@ fetching, L0 mcap/earnings, L3, L4, L5, API, DB, alerts, scheduler.
 [x] Engine phase 2 -- Universe (mmap) + indicator kernels + parity tests
 [x] Engine phase 3 -- score_layer1/2 + pybind11 + USE_CPP_ENGINE swap in Step 4
 [x] Engine phase 4 -- ThreadPool + Google Benchmark vs Python Step 4
-[ ] Engine phase 5 -- StreamingIndicators + backtester + CI + README
+[x] Engine phase 5 -- StreamingIndicators + backtester + CI + README
