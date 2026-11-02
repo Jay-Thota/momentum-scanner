@@ -224,8 +224,9 @@ With the C++ path on, the scan asks Alpaca for raw JSON and fills the engine's
 arrays straight from it, parsing all timestamps in one vectorized call. No Bar
 objects and no DataFrames for the ~3,300 tickers. A lazy mapping builds a
 DataFrame only when a later step asks for that ticker (about 1,500 survivors).
-Response to end of Step 4: 15.7 s to 0.41 s (38x); counting the later
-survivor DataFrames, about 1.3 s.
+Response to end of Step 4: 10.5 s to 0.28 s (37x); counting the 0.63 s of
+later survivor DataFrames, 0.91 s (11.5x). (On AC power, Release build; the
+first measurement, on battery in Low Power Mode, was 15.7 s to 0.41 s.)
 
 **How do you keep the downstream code working?**
 `LazyOhlcvMap` behaves like the `{ticker: DataFrame}` dict the scan always
@@ -278,32 +279,33 @@ ThreadSanitizer, which flags unsynchronized access even when the test
 happened to pass.
 
 **Where does scaling stop, and why?** (M3 Pro: 5 performance + 6 efficiency
-cores; battery, Low Power Mode)
+cores; AC power, Low Power Mode off, Release build, phase 4 code)
 
 | threads | backtest, every day (3.07M scores) | production scan |
 |---|---|---|
-| 1 | 51.3 s | 33.2 ms |
-| 2 | 25.6 s (2.0x) | 16.8 ms (2.0x) |
-| 4 | 13.1 s (3.9x) | 9.0 ms (3.7x) |
-| 8 | 8.4 s (6.1x) | 8.8 ms (3.8x) |
-| 11 | 7.6 s (6.8x) | 9.1 ms (3.7x) |
+| 1 | 34.9 s | 23.2 ms |
+| 2 | 18.0 s (1.9x) | 12.0 ms (1.9x) |
+| 4 | 9.49 s (3.7x) | 6.56 ms (3.5x) |
+| 8 | 6.64 s (5.3x) | 6.91 ms (3.4x) |
+| 11 | 6.28 s (5.6x) | 7.66 ms (3.0x) |
 
-The backtest is nearly perfect up to 4 threads: each ticker's data and
+The backtest is close to linear up to 4 threads: each ticker's data and
 scratch arrays fit in the core's own caches, and threads share nothing but
-one atomic add per chunk. Past 5 threads the extra threads land on efficiency
-cores. If one of those does about 0.37 of a performance core's work,
-5 + 3 x 0.37 = 6.1x at 8 threads (measured 6.1x) and 5 + 6 x 0.37 = 7.2x at
-11 (measured 6.8x). The hardware stops scaling, not the code.
+one atomic add per chunk. Past 5 threads the extra threads land on the
+slower efficiency cores, so each one adds less.
 
-The production scan stops at about 4 threads for a different reason: the
-whole job is 33 ms. Split 8 ways, each chunk is about a millisecond, so
-waking threads, handing out chunks and waiting for the last (slowest, often
-on an efficiency core) chunk are a big share of the total. Small jobs don't
-parallelize well; the scan stays single-threaded, since 36 ms isn't worth it.
+The production scan stops at 4 threads and gets slower after. At the time I
+put that down to fork/join overhead on a 23 ms job. That was wrong, or at
+least not the main reason: phase 5 found that `py_round` used `snprintf` and
+`strtod`, which on macOS touch shared global locale state, so every thread
+contended on it. Scoring a day from scratch is expensive enough to hide that
+in the backtest; the short production job is not. With the rounding fixed
+the same scan scales to 6.5x at 11 threads (see phase 5). Lesson: when
+scaling stops, profile before explaining it.
 
 **What's still slow?**
 The backtest recomputes every indicator over the whole history for every
-day, so its cost grows with days squared: 51 s single-threaded. Phase 5's
+day, so its cost grows with days squared: 35 s single-threaded. Phase 5's
 streaming indicators update each day in O(1) instead. That is a far bigger
 win than any number of threads.
 
@@ -312,4 +314,6 @@ Layer 1 signal C came out of a numpy comparison, so it was a numpy bool, and
 `json.dumps(..., default=str)` stored it as the string "True" or "False".
 In JavaScript the string "False" is truthy. Phase 3 matched the quirk so the
 two paths could be compared exactly; phase 4 fixed it in both paths in its
-own commit. Rows stored before the fix still hold the strings.
+own commit. Rows stored before the fix still hold the strings; the API
+converts them back to booleans when it reads them (no migration).
+
