@@ -1,0 +1,23 @@
+# Keep local-only files out of `docker build` contexts. Railway builds from
+# the git checkout, which already lacks these; this matters for local builds.
+.git/
+venv/
+**/__pycache__/
+*.pyc
+.env
+.env.local
+*.db
+*.sqlite
+*.sqlite3
+logs/
+scan_results/
+backend/data/finra_cache/
+data/finra/
+frontend/node_modules/
+frontend/.next/
+.DS_Store
+com.momentumscanner.plist
+
+# Engine build trees hold CMake caches with host paths; data is 170 MB
+engine/build*/
+engine/data/

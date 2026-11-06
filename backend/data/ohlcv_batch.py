@@ -31,6 +31,11 @@ from backend.data.fetcher_price import _compute_obv
 
 FIELDS = ("Open", "High", "Low", "Close", "Volume")
 
+# The datetime64 unit pandas gives an index built from a list of datetimes, as
+# bars_to_frame builds it: "us" on pandas 3, "ns" on pandas 2 (what
+# requirements.txt pins for production). frame() converts to it.
+_INDEX_UNIT = pd.DatetimeIndex([pd.Timestamp(0).to_pydatetime()]).unit
+
 
 @dataclass
 class OhlcvBatch:
@@ -98,7 +103,7 @@ class OhlcvBatch:
             idx = pd.DatetimeIndex(ts_us[mask].astype("datetime64[us]"))   # UTC calendar date
             dates[mask] = idx.year * 10000 + idx.month * 100 + idx.day
         # alpaca-py's Bar models carry pydantic's UTC tzinfo; reuse it so frame()
-        # rebuilds the identical index (datetime64[us, UTC] with TzInfo(0))
+        # rebuilds the identical index (UTC with TzInfo(0), in _INDEX_UNIT)
         return cls(list(tickers), lengths, arrays, dates, ts_us, TzInfo(0))
 
     @classmethod
@@ -154,7 +159,8 @@ class OhlcvBatch:
         if self.ts_us is None or self.ts_us[i, sl][0] == 0:   # no bar is stamped 1970-01-01
             raise ValueError(f"{ticker}: row was built from a DataFrame; keep that frame instead")
         df = pd.DataFrame({f: self.arrays[f][i, sl].copy() for f in FIELDS})
-        df.index = pd.DatetimeIndex(self.ts_us[i, sl].astype("datetime64[us]")).tz_localize(self.tz)
+        df.index = (pd.DatetimeIndex(self.ts_us[i, sl].astype("datetime64[us]"))
+                    .tz_localize(self.tz).as_unit(_INDEX_UNIT))
         df["OBV"] = _compute_obv(df)
         return df
 

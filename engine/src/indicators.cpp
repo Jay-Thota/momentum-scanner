@@ -4,8 +4,13 @@
 #include <limits>
 #include <stdexcept>
 
+#include "mscan/detail/adx_terms.h"
+#include "mscan/detail/pandas_rolling_mean.h"
+
 namespace mscan::ind {
 namespace {
+
+using detail::PandasRollingMean;
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
@@ -15,78 +20,6 @@ void require_same_size(std::size_t in, std::size_t out, const char* fn) {
 
 void require_period(int period, const char* fn) {
   if (period < 1) throw std::invalid_argument(std::string(fn) + ": period must be >= 1");
-}
-
-// State of pandas rolling(window).mean(), bit for bit. A port of roll_mean in
-// pandas/_libs/window/aggregations.pyx (v3.0.3, lines 198-316); line numbers
-// below refer to that file. The caller adds each value as it enters the
-// window and removes it as it leaves, so every step is O(1) and the state is
-// a handful of scalars: no buffer, no allocation.
-//
-// Relies on -ffp-contract=off and no -ffast-math: either would let the
-// compiler rewrite the Kahan steps and break parity.
-class PandasRollingMean {
- public:
-  explicit PandasRollingMean(std::size_t window) : window_(window) {}
-
-  // add_mean (221-250)
-  void add(double v) {
-    if (std::isnan(v)) return;
-    ++nobs_;
-    const double y = v - comp_add_;
-    const double t = sum_ + y;
-    comp_add_ = (t - sum_) - y;
-    sum_ = t;
-    if (std::signbit(v)) ++neg_ct_;
-    same_run_ = (v == prev_) ? same_run_ + 1 : 1;   // GH#42064
-    prev_ = v;
-  }
-
-  // remove_mean (253-266)
-  void remove(double v) {
-    if (std::isnan(v)) return;
-    --nobs_;
-    const double y = -v - comp_remove_;
-    const double t = sum_ + y;
-    comp_remove_ = (t - sum_) - y;
-    sum_ = t;
-    if (std::signbit(v)) --neg_ct_;
-  }
-
-  // calc_mean (198-218), with min_periods == window
-  double value() const {
-    if (nobs_ < window_ || nobs_ == 0) return kNaN;
-    if (same_run_ >= nobs_) return prev_;   // window is one repeated value
-    const double r = sum_ / static_cast<double>(nobs_);
-    if (neg_ct_ == 0 && r < 0) return 0.0;        // all inputs >= 0
-    if (neg_ct_ == nobs_ && r > 0) return 0.0;    // all inputs negative
-    return r;
-  }
-
- private:
-  std::size_t window_;
-  double sum_ = 0.0;
-  double comp_add_ = 0.0;      // Kahan error carried by additions   (292)
-  double comp_remove_ = 0.0;   // ... and separately by removals     (292)
-  std::size_t nobs_ = 0;       // non-NaN values in the window
-  std::size_t neg_ct_ = 0;     // how many of them have the sign bit set
-  std::size_t same_run_ = 0;   // length of the current run of equal values
-  // pandas seeds this with values[0] (294). NaN behaves identically: the
-  // first non-NaN add sets same_run_ to 1 either way.
-  double prev_ = kNaN;
-};
-
-// max(a, b, c) skipping NaN, NaN if all three are NaN: DataFrame.max(axis=1).
-double nan_max3(double a, double b, double c) {
-  double m = -std::numeric_limits<double>::infinity();
-  bool any = false;
-  for (double v : {a, b, c}) {
-    if (!std::isnan(v)) {
-      any = true;
-      if (v > m) m = v;
-    }
-  }
-  return any ? m : kNaN;
 }
 
 }  // namespace
@@ -171,25 +104,11 @@ void adx(const BarSeries& bars, int period, AdxOut out) {
   const auto& c = bars.close;
 
   // Bar 0 has no previous bar: pandas' shift(1) gives NaN there.
-  auto true_range = [&](std::size_t i) {
-    const double prev_close = i > 0 ? c[i - 1] : kNaN;
-    return nan_max3(h[i] - l[i], std::fabs(h[i] - prev_close), std::fabs(l[i] - prev_close));
-  };
-  // np.where(cond, move, 0.0): comparisons with NaN are false, so 0.0
-  auto plus_dm = [&](std::size_t i) {
-    if (i == 0) return 0.0;
-    const double up = h[i] - h[i - 1], down = l[i - 1] - l[i];
-    return (up > down && up > 0) ? up : 0.0;
-  };
-  auto minus_dm = [&](std::size_t i) {
-    if (i == 0) return 0.0;
-    const double up = h[i] - h[i - 1], down = l[i - 1] - l[i];
-    return (down > up && down > 0) ? down : 0.0;
-  };
-  auto dx = [&](std::size_t i) {
-    const double pdi = out.plus_di[i], mdi = out.minus_di[i];
-    return 100.0 * std::fabs(pdi - mdi) / (pdi + mdi);
-  };
+  auto prev = [](std::span<const double> x, std::size_t i) { return i > 0 ? x[i - 1] : kNaN; };
+  auto true_range = [&](std::size_t i) { return detail::true_range(h[i], l[i], prev(c, i)); };
+  auto plus_dm = [&](std::size_t i) { return detail::plus_dm(h[i], l[i], prev(h, i), prev(l, i)); };
+  auto minus_dm = [&](std::size_t i) { return detail::minus_dm(h[i], l[i], prev(h, i), prev(l, i)); };
+  auto dx = [&](std::size_t i) { return detail::dx(out.plus_di[i], out.minus_di[i]); };
 
   PandasRollingMean atr(p), plus_mean(p), minus_mean(p), dx_mean(p);
   for (std::size_t i = 0; i < n; ++i) {

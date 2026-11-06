@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "golden.h"
 #include "mscan/indicators.h"
 #include "mscan/layers.h"
 
@@ -30,48 +31,9 @@ namespace {
 
 namespace fs = std::filesystem;
 namespace ind = mscan::ind;
-
-struct GoldenSeries {
-  std::string name;
-  std::vector<std::string> dates;   // YYYY-MM-DD
-  std::map<std::string, std::vector<double>> cols;
-  const std::vector<double>& col(const std::string& c) const { return cols.at(c); }
-  std::size_t size() const { return cols.at("Close").size(); }
-};
-
-GoldenSeries load_series(const fs::path& path) {
-  GoldenSeries g;
-  g.name = path.stem().string();
-  std::ifstream in(path);
-  std::string line, cell;
-  std::getline(in, line);
-  std::vector<std::string> header;
-  for (std::stringstream ss(line); std::getline(ss, cell, ',');) header.push_back(cell);
-  while (std::getline(in, line)) {
-    std::stringstream ss(line);
-    std::getline(ss, cell, ',');
-    g.dates.push_back(cell);
-    for (std::size_t c = 1; c < header.size() && std::getline(ss, cell, ','); ++c) {
-      g.cols[header[c]].push_back(std::strtod(cell.c_str(), nullptr));   // "nan" -> NaN
-    }
-  }
-  return g;
-}
-
-std::vector<GoldenSeries> load_all() {
-  const fs::path dir = fs::path(MSCAN_ENGINE_DIR) / "tests" / "golden" / "series";
-  std::vector<fs::path> files;
-  for (const auto& e : fs::directory_iterator(dir)) files.push_back(e.path());
-  std::sort(files.begin(), files.end());
-  std::vector<GoldenSeries> out;
-  for (const auto& f : files) out.push_back(load_series(f));
-  return out;
-}
-
-const std::vector<GoldenSeries>& goldens() {
-  static const std::vector<GoldenSeries> all = load_all();
-  return all;
-}
+using mscan_test::GoldenSeries;
+using mscan_test::goldens;
+using mscan_test::load_series;
 
 int64_t ulp_distance(double a, double b) {
   const auto ia = std::bit_cast<int64_t>(a), ib = std::bit_cast<int64_t>(b);

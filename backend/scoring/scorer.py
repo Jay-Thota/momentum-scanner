@@ -261,11 +261,37 @@ def score_l1l2(
     if config.USE_CPP_ENGINE if use_cpp is None else use_cpp:
         try:
             from backend.scoring.cpp_engine import score_l1l2_cpp
-            return score_l1l2_cpp(tickers, ohlcv_map)
+            results = score_l1l2_cpp(tickers, ohlcv_map)
         except Exception as exc:
             logger.warning("C++ engine unavailable or failed (%s: %s) -- using Python for Step 4",
                            type(exc).__name__, exc)
+        else:
+            if config.CPP_ENGINE_SHADOW:
+                try:
+                    _shadow_check(tickers, ohlcv_map, results)
+                except Exception:   # a verification aid must never fail the scan
+                    logger.exception("Step 4 shadow check failed")
+            return results
     return _score_l1l2_python(tickers, ohlcv_map)
+
+
+def _shadow_check(tickers: list[str], ohlcv_map: dict[str, pd.DataFrame], cpp: dict[str, dict]) -> int:
+    """
+    CPP_ENGINE_SHADOW: rerun Step 4 in Python on the same data and log how many
+    tickers differ. Compares the JSON save_results_to_db would store, so float
+    bits, None vs NaN and bool vs "True" all count. Returns the count.
+    """
+    t0 = time.time()
+    py = _score_l1l2_python(tickers, ohlcv_map)
+    stored = lambda r: json.dumps(r, default=str)   # noqa: E731
+    differ = [t for t in tickers if stored(cpp.get(t)) != stored(py.get(t))]
+    if differ:
+        logger.warning("Step 4 shadow check: %d of %d tickers differ between C++ and Python: %s",
+                       len(differ), len(tickers), ", ".join(differ[:10]))
+    else:
+        logger.info("Step 4 shadow check: C++ matches Python on all %d tickers (Python took %.1fs)",
+                    len(tickers), time.time() - t0)
+    return len(differ)
 
 
 def _prefetch_sector_data() -> tuple[dict, dict, dict]:

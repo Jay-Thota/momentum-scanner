@@ -224,8 +224,9 @@ With the C++ path on, the scan asks Alpaca for raw JSON and fills the engine's
 arrays straight from it, parsing all timestamps in one vectorized call. No Bar
 objects and no DataFrames for the ~3,300 tickers. A lazy mapping builds a
 DataFrame only when a later step asks for that ticker (about 1,500 survivors).
-Response to end of Step 4: 15.7 s to 0.41 s (38x); counting the later
-survivor DataFrames, about 1.3 s.
+Response to end of Step 4: 10.5 s to 0.28 s (37x); counting the 0.63 s of
+later survivor DataFrames, 0.91 s (11.5x). (On AC power, Release build; the
+first measurement, on battery in Low Power Mode, was 15.7 s to 0.41 s.)
 
 **How do you keep the downstream code working?**
 `LazyOhlcvMap` behaves like the `{ticker: DataFrame}` dict the scan always
@@ -278,32 +279,33 @@ ThreadSanitizer, which flags unsynchronized access even when the test
 happened to pass.
 
 **Where does scaling stop, and why?** (M3 Pro: 5 performance + 6 efficiency
-cores; battery, Low Power Mode)
+cores; AC power, Low Power Mode off, Release build, phase 4 code)
 
 | threads | backtest, every day (3.07M scores) | production scan |
 |---|---|---|
-| 1 | 51.3 s | 33.2 ms |
-| 2 | 25.6 s (2.0x) | 16.8 ms (2.0x) |
-| 4 | 13.1 s (3.9x) | 9.0 ms (3.7x) |
-| 8 | 8.4 s (6.1x) | 8.8 ms (3.8x) |
-| 11 | 7.6 s (6.8x) | 9.1 ms (3.7x) |
+| 1 | 34.9 s | 23.2 ms |
+| 2 | 18.0 s (1.9x) | 12.0 ms (1.9x) |
+| 4 | 9.49 s (3.7x) | 6.56 ms (3.5x) |
+| 8 | 6.64 s (5.3x) | 6.91 ms (3.4x) |
+| 11 | 6.28 s (5.6x) | 7.66 ms (3.0x) |
 
-The backtest is nearly perfect up to 4 threads: each ticker's data and
+The backtest is close to linear up to 4 threads: each ticker's data and
 scratch arrays fit in the core's own caches, and threads share nothing but
-one atomic add per chunk. Past 5 threads the extra threads land on efficiency
-cores. If one of those does about 0.37 of a performance core's work,
-5 + 3 x 0.37 = 6.1x at 8 threads (measured 6.1x) and 5 + 6 x 0.37 = 7.2x at
-11 (measured 6.8x). The hardware stops scaling, not the code.
+one atomic add per chunk. Past 5 threads the extra threads land on the
+slower efficiency cores, so each one adds less.
 
-The production scan stops at about 4 threads for a different reason: the
-whole job is 33 ms. Split 8 ways, each chunk is about a millisecond, so
-waking threads, handing out chunks and waiting for the last (slowest, often
-on an efficiency core) chunk are a big share of the total. Small jobs don't
-parallelize well; the scan stays single-threaded, since 36 ms isn't worth it.
+The production scan stops at 4 threads and gets slower after. At the time I
+put that down to fork/join overhead on a 23 ms job. That was wrong, or at
+least not the main reason: phase 5 found that `py_round` used `snprintf` and
+`strtod`, which on macOS touch shared global locale state, so every thread
+contended on it. Scoring a day from scratch is expensive enough to hide that
+in the backtest; the short production job is not. With the rounding fixed
+the same scan scales to 6.5x at 11 threads (see phase 5). Lesson: when
+scaling stops, profile before explaining it.
 
 **What's still slow?**
 The backtest recomputes every indicator over the whole history for every
-day, so its cost grows with days squared: 51 s single-threaded. Phase 5's
+day, so its cost grows with days squared: 35 s single-threaded. Phase 5's
 streaming indicators update each day in O(1) instead. That is a far bigger
 win than any number of threads.
 
@@ -312,4 +314,131 @@ Layer 1 signal C came out of a numpy comparison, so it was a numpy bool, and
 `json.dumps(..., default=str)` stored it as the string "True" or "False".
 In JavaScript the string "False" is truthy. Phase 3 matched the quirk so the
 two paths could be compared exactly; phase 4 fixed it in both paths in its
-own commit. Rows stored before the fix still hold the strings.
+own commit. Rows stored before the fix still hold the strings; the API
+converts them back to booleans when it reads them (no migration).
+
+## Phase 5: streaming indicators, backtester, CI, deployment
+
+**Why was the phase 4 backtest quadratic?**
+Scoring day d recomputed every indicator over the whole history up to d. A
+ticker with D days costs 1 + 2 + ... + D bar updates, which grows with D
+squared. 3.07M (ticker, day) scores took 34 s single-threaded.
+
+**What are streaming indicators?**
+`StreamingIndicators` holds the state each indicator needs and moves it
+forward by one bar in O(1): the pandas rolling-mean state for each SMA and
+each ADX term, the running OBV total, and short rings of recent values (the
+close leaving the 200-day window, the ADX terms leaving the 14-day one, the
+50/200-day SMAs from 5 and 10 days ago). Each day costs the same no matter
+how much history came before, so the backtest is linear in days. Same
+3.07M scores: 34.4 s to 0.62 s (55x).
+
+**How do you know streaming gives the same numbers?**
+It feeds the same values into the same `PandasRollingMean` in the same
+order as the batch kernels, starting from the same first bar, so the
+floating-point operations are identical, not just close. The rolling mean and
+ADX formulas moved into `detail/` headers so both paths share one copy.
+Tests stream synthetic series (flat runs, NaN holes), all 68 goldens and
+every ticker in the 4-year file, and compare every value at every bar
+bit for bit.
+
+**Why do the scores also match without duplicating the layer code?**
+The layers only read raw bars near the newest day; everything that grows
+with history is an indicator series. So `score_layer1/2` take an
+`IndicatorSnapshot` (the newest indicator values plus the lagged SMAs) and
+the batch versions build that same snapshot from their full vectors. One
+scoring code path, two ways to fill the snapshot. A test scores every bar
+of every golden both ways and requires every result field to match.
+
+**How does the rolling max work?**
+OBV must be compared with its 20-day high every day. A monotonic deque keeps
+candidates in decreasing order: a new value pops every smaller value off the
+back (they can never be the max again while it is in the window), and the
+front drops out by index once it leaves the window. Each value enters and
+leaves once, so it's O(1) amortized. It's tested against brute force with
+NaNs and many equal values.
+
+**Where does the memory live?**
+In fixed-size `std::array`s inside the object, about 6 KB, so `update()`
+never touches the heap (a test counts allocations) and each worker keeps
+its ticker's state on its own stack.
+
+**How is look-ahead ruled out?**
+By structure and by test. Selection only sees `series(i, d)` and streaming
+state fed bars up to d. Forward returns are computed in a separate pass
+after all picks are made. The test replaces every bar after day d with
+garbage (huge values, zeros, negatives, NaN, SPY included) and requires the
+picks through d to be unchanged. I proved the test can fail by planting a
+one-day leak in the price gate: it failed.
+
+**How does the backtest use threads?**
+Workers split the tickers; each streams its tickers through every day and
+writes scores into its own slice of a ticker-major matrix, so no two
+workers write the same memory and no locks are needed. Picking the top N
+per day then runs on one thread. Results are identical for any thread
+count (tested).
+
+**What does it reproduce from the live scan?**
+Step 2's price/volume gate, layers 1 and 2 with Step 4's inputs, and the
+regime rule from `regime_filter` (on SPY, since that's what the file has).
+In a bear regime the live scan raises the bar from 4.0 to 5.0, so the
+backtest raises its PV threshold too. `validate_backtest` re-derives sampled
+days' picks with the scan's own Python functions; they match exactly.
+
+**How are Sharpe and drawdown computed?**
+Each day's picks get 1/h of the capital for h days (a staggered portfolio),
+which gives one real return per day instead of overlapping h-day returns.
+Sharpe is mean / stdev * sqrt(252) with no risk-free rate; drawdown is the
+largest fall from a peak of that portfolio.
+
+**Why did 8 threads run slower than 1?**
+Profiling showed rounding was 80% of streaming time: `py_round` formatted
+with `snprintf` and parsed with `strtod`, and on macOS both touch shared
+global locale state, so threads fought over it. Two fixes, each its own
+commit. First `std::to_chars`/`from_chars`, which the standard defines as
+printf/strtod in the "C" locale but which touch no shared state. Then an
+exact shortcut: Python rounds the exact value of x * 10^n, and
+`fma(x, p, -x*p)` gives the exact rounding error of the product, so
+`rint(x*p)` only needs correcting when the product lands exactly on a half.
+A test compares it with the decimal path on ~7M values and ties; removing
+the tie correction makes it fail. This also explained phase 4's production
+scan plateau.
+
+**What did Linux and the production stack catch?**
+Two bugs, invisible on the Mac:
+- `requirements.txt` pins pandas 2.1.4, which gives an index built from
+  datetimes nanosecond resolution; pandas 3 (the local venv) gives
+  microseconds. The arrays path hardcoded microseconds, so in production its
+  rebuilt DataFrames would have differed. Scores were fine; it's fixed, and
+  parity now runs in the production Docker image and in CI on those pins.
+- The test binary's allocation counter replaced `operator new` but not the
+  `nothrow` form, so gtest's memory came from one allocator and went back
+  to another. Linux ASan reports that mismatch; macOS ASan doesn't check it.
+
+**How is production verified?**
+`CPP_ENGINE_SHADOW=true` makes Step 4 also run the Python layers on the same
+in-memory data and log how many tickers differ, so a deployment checks
+itself on that day's real data without fetching twice.
+
+**Benchmarks** (M3 Pro, AC power, Low Power Mode off, Release build)
+
+| threads | backtest, batch indicators | backtest, streaming | full run_backtest | production scan |
+|---|---|---|---|---|
+| 1 | 34.4 s | 623 ms | 393 ms | 22.7 ms |
+| 2 | 17.9 s (1.9x) | 304 ms (2.0x) | 211 ms (1.9x) | 11.8 ms (1.9x) |
+| 4 | 9.66 s (3.6x) | 157 ms (4.0x) | 112 ms (3.5x) | 6.37 ms (3.6x) |
+| 8 | 6.42 s (5.4x) | 99.5 ms (6.3x) | 75.0 ms (5.2x) | 4.23 ms (5.4x) |
+| 11 | 5.44 s (6.3x) | 83.8 ms (7.4x) | 63.5 ms (6.2x) | 3.51 ms (6.5x) |
+
+End to end, Alpaca response to end of Step 4 (single-threaded): Python
+10.5 s, C++ via DataFrames 4.6 s, C++ via arrays 0.28 s (38x); plus 0.64 s of
+survivor DataFrames after Step 5 on the arrays path.
+
+**What did the backtest find?**
+PV-only, top 10 a day, next-open fills, 2023-10-31 to 2026-10-28: positive
+returns (+1.35% per 20-day pick) but behind SPY (-0.27% excess, 45% hit
+rate) in a window where SPY rose 92%. The bigger finding is that the PV
+score saturates: on 542 of 751 days all 10 picks tie at the maximum 3.0 and
+the alphabetical tie-break chooses them. Layers 3 to 5 break those ties in
+the live scan, so this says the PV part can't rank on its own, not that the
+full model fails.

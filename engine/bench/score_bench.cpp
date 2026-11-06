@@ -4,8 +4,12 @@
 //                           score_layer1 + score_layer2 on series(i, d): the shape
 //                           of a backtest that rescores the universe each day.
 //                           Each call recomputes indicators over the whole prefix,
-//                           so total work grows with D^2 per ticker (phase 5's
-//                           streaming indicators remove that).
+//                           so total work grows with D^2 per ticker.
+//   BM_StreamingEveryDay/T  the same scores (bit-identical), with indicators
+//                           carried forward by StreamingIndicators: O(1) per
+//                           day, so total work grows with D.
+//   BM_RunBacktest/T        run_backtest over the whole file: streaming
+//                           scoring, picks, forward returns and stats.
 //   BM_ProductionScan/T     the daily scan's Step 4: the last day for every
 //                           ticker, on the last 206 bars (Alpaca's 300-calendar-
 //                           day lookback).
@@ -24,7 +28,9 @@
 #include <string>
 #include <thread>
 
+#include "mscan/backtest.h"
 #include "mscan/layers.h"
+#include "mscan/streaming.h"
 #include "mscan/thread_pool.h"
 #include "mscan/universe.h"
 
@@ -79,6 +85,66 @@ void BM_BacktestEveryDay(benchmark::State& state) {
   state.counters["evaluations"] = static_cast<double>(evaluations);
 }
 
+void BM_StreamingEveryDay(benchmark::State& state) {
+  const auto* u = universe();
+  if (u == nullptr) {
+    state.SkipWithError("engine/data/history.bin not found");
+    return;
+  }
+  const mscan::ScoringConfig cfg;
+  mscan::ThreadPool pool(static_cast<std::size_t>(state.range(0)));
+  const std::size_t days = u->num_days();
+  std::size_t evaluations = 0;
+  for (std::size_t i = 0; i < u->num_tickers(); ++i) {
+    if (u->first_valid_day(i) < days) evaluations += days - u->first_valid_day(i);
+  }
+
+  for (auto _ : state) {
+    std::atomic<double> sum{0.0};
+    pool.parallel_for(u->num_tickers(), [&](std::size_t begin, std::size_t end) {
+      double local = 0.0;
+      for (std::size_t i = begin; i < end; ++i) {
+        mscan::ind::StreamingIndicators st(cfg.roc_period, cfg.obv_lookback_days);
+        for (std::size_t d = u->first_valid_day(i); d < days; ++d) {
+          const mscan::BarSeries s = u->series(i, d);
+          const std::size_t k = s.size() - 1;
+          st.update(s.open[k], s.high[k], s.low[k], s.close[k], s.volume[k]);
+          const mscan::IndicatorSnapshot snap = mscan::snapshot(st, cfg);
+          local += checksum(mscan::score_layer1(s, 0, snap, cfg),
+                            mscan::score_layer2(s, std::nullopt, snap, cfg));
+        }
+      }
+      sum.fetch_add(local);
+    });
+    benchmark::DoNotOptimize(sum.load());
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * evaluations));
+  state.counters["evaluations"] = static_cast<double>(evaluations);
+}
+
+void BM_RunBacktest(benchmark::State& state) {
+  const auto* u = universe();
+  if (u == nullptr) {
+    state.SkipWithError("engine/data/history.bin not found");
+    return;
+  }
+  mscan::BacktestConfig cfg;
+  cfg.end_day = u->num_days() - 1;
+  cfg.eligible.assign(u->num_tickers(), 1);
+  for (std::size_t i = 0; i < u->num_tickers(); ++i) {
+    // history.bin order: SPY, then the 11 sector ETFs, then equities
+    if (i < 12) cfg.eligible[i] = 0;
+  }
+  mscan::ThreadPool pool(static_cast<std::size_t>(state.range(0)));
+  std::size_t picks = 0;
+  for (auto _ : state) {
+    const auto r = mscan::run_backtest(*u, 0, cfg, pool);
+    picks = r.picks.size();
+    benchmark::DoNotOptimize(picks);
+  }
+  state.counters["picks"] = static_cast<double>(picks);
+}
+
 void BM_ProductionScan(benchmark::State& state) {
   const auto* u = universe();
   if (u == nullptr) {
@@ -120,5 +186,9 @@ void thread_counts(benchmark::internal::Benchmark* b) {
 
 BENCHMARK(BM_BacktestEveryDay)->Apply(thread_counts)
     ->Iterations(1)->UseRealTime()->Unit(benchmark::kSecond);
+BENCHMARK(BM_StreamingEveryDay)->Apply(thread_counts)
+    ->UseRealTime()->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_RunBacktest)->Apply(thread_counts)
+    ->UseRealTime()->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_ProductionScan)->Apply(thread_counts)
     ->UseRealTime()->Unit(benchmark::kMillisecond);

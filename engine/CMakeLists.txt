@@ -12,8 +12,10 @@ option(MSCAN_PYTHON "Build pybind11 module" ON)
 option(MSCAN_BUILD_TESTS "Build tests and benchmarks" ON)
 
 if(MSCAN_SANITIZE)
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=address,undefined)
+  # -fno-sanitize-recover: UBSan aborts on the first error instead of printing
+  # it and carrying on, so a CI test run fails on undefined behavior
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined -fno-sanitize-recover=all)
 endif()
 if(MSCAN_TSAN)
   add_compile_options(-fsanitize=thread)
@@ -26,6 +28,7 @@ add_library(mscan_core STATIC
   src/indicators.cpp
   src/layers.cpp
   src/thread_pool.cpp
+  src/streaming.cpp
   src/backtest.cpp)
 target_include_directories(mscan_core PUBLIC include)
 target_compile_options(mscan_core PRIVATE -Wall -Wextra -Wpedantic -Werror
@@ -49,6 +52,7 @@ if(MSCAN_BUILD_TESTS)
   add_executable(mscan_tests
     tests/universe_test.cpp       # mmap loader: bad magic, truncation, NaN left-padding
     tests/indicators_test.cpp     # hand-computed small cases + NaN warm-up
+    tests/streaming_test.cpp      # StreamingIndicators vs the batch kernels
     tests/rounding_test.cpp       # py_round / np_round vs Python
     tests/parity_test.cpp         # vs. golden CSVs dumped from the Python layers
     tests/thread_pool_test.cpp

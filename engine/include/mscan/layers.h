@@ -14,6 +14,10 @@
 
 namespace mscan {
 
+namespace ind {
+class StreamingIndicators;
+}
+
 // Mirrors backend/config.py defaults. Python passes its live values in, so env
 // overrides still work and there is one source of truth.
 struct ScoringConfig {
@@ -72,11 +76,36 @@ struct SectorContext {
   std::optional<int> rs_rank;
 };
 
+// Indicator values the layers read, all on the newest bar of `bars` unless
+// noted. Apart from these, the layers only read raw bars near the newest one,
+// so given a snapshot they skip the full-series indicator work. NaN where
+// pandas would have NaN.
+struct IndicatorSnapshot {
+  double ma20, ma50, ma200;
+  double ma50_slope_ago, ma200_slope_ago;   // ma_slope_lookback bars back
+  double ma50_cross_ago, ma200_cross_ago;   // golden_cross_lookback bars back
+  double roc, adx, di_p, di_n;
+  double obv, obv_high;   // OBV and its max over the last obv_lookback_days bars
+};
+
+// The snapshot for the newest bar fed to `s`. Built from bars starting at the
+// same first bar, it equals what the batch scorers compute, bit for bit.
+IndicatorSnapshot snapshot(const ind::StreamingIndicators& s, const ScoringConfig& cfg);
+
+// Batch: computes the indicators over all of `bars`. O(bars.size()).
 Layer1Result score_layer1(const BarSeries& bars, int block_trades,
                           const ScoringConfig& cfg);
 
 Layer2Result score_layer2(const BarSeries& bars,
                           const std::optional<SectorContext>& sector,
                           const ScoringConfig& cfg);
+
+// Same scores from precomputed indicators. O(1) in bars.size().
+Layer1Result score_layer1(const BarSeries& bars, int block_trades,
+                          const IndicatorSnapshot& ind, const ScoringConfig& cfg);
+
+Layer2Result score_layer2(const BarSeries& bars,
+                          const std::optional<SectorContext>& sector,
+                          const IndicatorSnapshot& ind, const ScoringConfig& cfg);
 
 }  // namespace mscan

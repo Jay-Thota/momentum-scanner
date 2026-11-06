@@ -14,15 +14,22 @@
 #include <stdexcept>
 #include <vector>
 
+#include "alloc_counter.h"
 #include "mscan/indicators.h"
 
 // ---------------------------------------------------------------------------
 // Allocation counter: replaces global operator new for this test binary so a
-// test can assert a kernel call performs zero heap allocations.
+// test can assert a kernel call performs zero heap allocations. Every
+// unaligned new/delete form is replaced, nothrow included: the deletes below
+// free() whatever they get, so a new left to the runtime (gtest's
+// stable_sort uses the nothrow form) would pair a runtime allocation with
+// free(), which ASan reports as alloc-dealloc-mismatch on Linux.
 // ---------------------------------------------------------------------------
 namespace {
 std::atomic<long> g_allocations{0};
 }
+
+long mscan_test::allocations() { return g_allocations.load(); }
 
 void* operator new(std::size_t n) {
   ++g_allocations;
@@ -30,10 +37,17 @@ void* operator new(std::size_t n) {
   throw std::bad_alloc();
 }
 void* operator new[](std::size_t n) { return ::operator new(n); }
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+  ++g_allocations;
+  return std::malloc(n == 0 ? 1 : n);
+}
+void* operator new[](std::size_t n, const std::nothrow_t& tag) noexcept { return ::operator new(n, tag); }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 
 namespace {
 
