@@ -230,7 +230,8 @@ py::dict run_backtest_py(const std::string& path, const py::dict& cfg_dict,
                          const std::vector<std::string>& exclude, const std::string& spy,
                          int top_n, double min_pv_score, double bear_min_pv_score,
                          std::vector<int> horizons, const std::string& fill, bool regime_filter,
-                         std::size_t num_threads) {
+                         std::size_t num_threads, const std::string& selection,
+                         std::uint64_t seed) {
   // Mapping the file and building the config only read Python objects up
   // front; the backtest itself runs without the GIL.
   Universe u = Universe::open_mmap(path);
@@ -253,6 +254,14 @@ py::dict run_backtest_py(const std::string& path, const py::dict& cfg_dict,
     throw std::invalid_argument("fill must be 'open_next_day' or 'close_same_day'");
   }
   cfg.apply_regime_filter = regime_filter;
+  if (selection == "top_score") {
+    cfg.selection = Selection::kTopScore;
+  } else if (selection == "random") {
+    cfg.selection = Selection::kRandom;
+  } else {
+    throw std::invalid_argument("selection must be 'top_score' or 'random'");
+  }
+  cfg.seed = seed;
 
   std::optional<std::size_t> spy_idx;
   cfg.eligible.assign(u.num_tickers(), 1);
@@ -305,6 +314,7 @@ py::dict run_backtest_py(const std::string& path, const py::dict& cfg_dict,
   out["elapsed_ms"] = r.elapsed_ms;
   out["evaluations"] = r.evaluations;
   out["bear_days"] = r.bear_days;
+  out["contested_days"] = r.contested_days;
   out["start"] = format_date(u.date(cfg.start_day));
   out["end"] = format_date(u.date(cfg.end_day));
   out["num_days"] = cfg.end_day - cfg.start_day + 1;
@@ -330,7 +340,9 @@ PYBIND11_MODULE(mscan_engine, m) {
         py::arg("bear_min_pv_score") = 2.5,
         py::arg("horizons") = std::vector<int>{5, 10, 20},
         py::arg("fill") = "open_next_day", py::arg("regime_filter") = true,
-        py::arg("num_threads") = 0,
+        py::arg("num_threads") = 0, py::arg("selection") = "top_score",
+        py::arg("seed") = 0,
         "Backtest the PV-only score (layers 1 + 2) over the mmapped history file. "
-        "num_threads=0 uses every hardware thread.");
+        "num_threads=0 uses every hardware thread. selection='random' draws top_n "
+        "of each day's candidates at random (a baseline), reproducibly from seed.");
 }
