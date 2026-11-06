@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -103,6 +104,22 @@ std::vector<bool> bear_days(const Universe& u, std::size_t spy_idx, const Backte
     bear[d - cfg.start_day] = !bull;
   }
   return bear;
+}
+
+// Uniform integer in [0, n). Not std::uniform_int_distribution: its algorithm
+// is up to the standard library, so libc++ (macOS) and libstdc++ (Linux CI)
+// would draw different picks from the same seed. mt19937_64's output is fixed
+// by the standard; rejecting the top partial block of 2^64 % n values keeps
+// the draw exactly uniform.
+std::size_t uniform_below(std::mt19937_64& rng, std::size_t n) {
+  const std::uint64_t range = n;
+  const std::uint64_t reject_from = std::numeric_limits<std::uint64_t>::max() -
+                                    std::numeric_limits<std::uint64_t>::max() % range;
+  std::uint64_t x;
+  do {
+    x = rng();
+  } while (x >= reject_from);
+  return static_cast<std::size_t>(x % range);
 }
 
 // Ticker i's open or close on day d; NaN before its first bar or past the end
@@ -214,9 +231,12 @@ BacktestResult run_backtest(const Universe& u, std::size_t spy_idx, const Backte
   const std::vector<bool> bear = cfg.apply_regime_filter ? bear_days(u, spy_idx, cfg)
                                                          : std::vector<bool>(days, false);
 
-  // Picks: per day, the top_n scores at or above that day's threshold.
-  // Ties go to the lower ticker index (alphabetical within the equities, like
-  // the scanner's stable sort).
+  // Picks: per day, top_n of the candidates at or above that day's threshold.
+  // kTopScore: highest scores, ties to the lower ticker index (alphabetical
+  // within the equities, like the scanner's stable sort). kRandom: one rng
+  // seeded once and consumed in day order, so picks depend only on the seed
+  // and the candidates, not on the thread count.
+  std::mt19937_64 rng(cfg.seed);
   std::vector<std::pair<double, std::uint32_t>> candidates;
   for (std::size_t k = 0; k < days; ++k) {
     const double threshold = bear[k] ? cfg.bear_min_pv_score : cfg.min_pv_score;
@@ -227,10 +247,19 @@ BacktestResult run_backtest(const Universe& u, std::size_t spy_idx, const Backte
       if (s >= threshold) candidates.emplace_back(s, static_cast<std::uint32_t>(i));   // NaN fails
     }
     const std::size_t take = std::min(candidates.size(), static_cast<std::size_t>(cfg.top_n));
-    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(take),
-                      candidates.end(), [](const auto& a, const auto& b) {
-                        return a.first != b.first ? a.first > b.first : a.second < b.second;
-                      });
+    result.contested_days += candidates.size() > take;
+    if (cfg.selection == Selection::kRandom) {
+      // Partial Fisher-Yates: after step c, candidates[0..c] is a uniform
+      // random sample without replacement
+      for (std::size_t c = 0; c < take; ++c) {
+        std::swap(candidates[c], candidates[c + uniform_below(rng, candidates.size() - c)]);
+      }
+    } else {
+      std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(take),
+                        candidates.end(), [](const auto& a, const auto& b) {
+                          return a.first != b.first ? a.first > b.first : a.second < b.second;
+                        });
+    }
     for (std::size_t c = 0; c < take; ++c) {
       Pick p;
       p.day = cfg.start_day + k;

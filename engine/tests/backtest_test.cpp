@@ -193,6 +193,82 @@ TEST(BacktestTest, PicksAreTopNAboveThresholdAndNeverSpy) {
   }
 }
 
+// Random baseline: the same seed reproduces the picks exactly, whatever the
+// thread count; another seed gives different ones.
+TEST(BacktestTest, RandomBaselineIsReproducibleFromItsSeed) {
+  const Panel p = synthetic_panel(60, 400, 8);
+  const auto u = p.universe();
+  auto cfg = config_for(u, 1.0);
+  cfg.top_n = 3;
+  cfg.selection = mscan::Selection::kRandom;
+  cfg.seed = 42;
+  mscan::ThreadPool one(1), many(8);
+  const auto a = mscan::run_backtest(u, 0, cfg, one);
+  const auto b = mscan::run_backtest(u, 0, cfg, many);
+  ASSERT_GT(a.contested_days, 0u) << "no day with a choice to make: the test proves nothing";
+  ASSERT_EQ(a.picks.size(), b.picks.size());
+  for (std::size_t k = 0; k < a.picks.size(); ++k) {
+    EXPECT_EQ(a.picks[k].day, b.picks[k].day);
+    EXPECT_EQ(a.picks[k].ticker_idx, b.picks[k].ticker_idx);
+  }
+  ASSERT_EQ(a.stats.size(), b.stats.size());
+  for (std::size_t h = 0; h < a.stats.size(); ++h) {
+    EXPECT_EQ(a.stats[h].mean_excess, b.stats[h].mean_excess);
+    EXPECT_EQ(a.stats[h].sharpe, b.stats[h].sharpe);
+  }
+
+  cfg.seed = 43;
+  const auto c = mscan::run_backtest(u, 0, cfg, one);
+  ASSERT_EQ(a.picks.size(), c.picks.size());   // same candidates, same count per day
+  std::size_t differ = 0;
+  for (std::size_t k = 0; k < a.picks.size(); ++k) differ += a.picks[k].ticker_idx != c.picks[k].ticker_idx;
+  EXPECT_GT(differ, 0u);
+}
+
+// Every random pick is a candidate the top-score run could have picked that
+// day: eligible, past the L0 gate and at or above the day's (regime)
+// threshold. Each day takes min(top_n, candidates), with no repeats.
+TEST(BacktestTest, RandomBaselinePicksOnlyFromTheEligibleCandidates) {
+  // SPY drifts down then the regime flips often enough to hit bear days
+  const Panel p = synthetic_panel(60, 500, 21, /*spy_drift=*/-0.0002);
+  const auto u = p.universe();
+  auto cfg = config_for(u, 1.0);
+  cfg.eligible.assign(u.num_tickers(), 1);
+  cfg.eligible[0] = 0;
+  for (std::size_t i = 5; i < u.num_tickers(); i += 5) cfg.eligible[i] = 0;
+  mscan::ThreadPool pool(4);
+
+  auto all_cfg = cfg;   // top_n past the universe size: every candidate
+  all_cfg.top_n = static_cast<int>(u.num_tickers());
+  const auto all = mscan::run_backtest(u, 0, all_cfg, pool);
+  std::vector<std::vector<std::uint32_t>> candidates(u.num_days());
+  for (const auto& pk : all.picks) candidates[pk.day].push_back(pk.ticker_idx);
+
+  cfg.top_n = 3;
+  cfg.selection = mscan::Selection::kRandom;
+  for (std::uint64_t seed : {1u, 2u, 3u}) {
+    cfg.seed = seed;
+    const auto r = mscan::run_backtest(u, 0, cfg, pool);
+    ASSERT_GT(r.contested_days, 0u);
+    std::vector<std::vector<std::uint32_t>> picked(u.num_days());
+    for (const auto& pk : r.picks) {
+      EXPECT_NE(cfg.eligible[pk.ticker_idx], 0) << "ineligible ticker " << pk.ticker_idx;
+      const auto& c = candidates[pk.day];
+      EXPECT_NE(std::find(c.begin(), c.end(), pk.ticker_idx), c.end())
+          << "day " << pk.day << " ticker " << pk.ticker_idx << " was not a candidate";
+      picked[pk.day].push_back(pk.ticker_idx);
+    }
+    for (std::size_t d = 0; d < u.num_days(); ++d) {
+      EXPECT_EQ(picked[d].size(), std::min<std::size_t>(3, candidates[d].size())) << "day " << d;
+      std::sort(picked[d].begin(), picked[d].end());
+      EXPECT_EQ(std::adjacent_find(picked[d].begin(), picked[d].end()), picked[d].end())
+          << "repeat pick on day " << d;
+    }
+  }
+  EXPECT_GT(all.bear_days, 0u) << "no bear days: the regime threshold went untested";
+  EXPECT_EQ(all.contested_days, 0u);
+}
+
 // SPY falls the whole time, so once its 200-day MA exists every day is bear
 // and an unreachable bear threshold leaves no picks on those days.
 TEST(BacktestTest, BearRegimeAppliesItsThreshold) {
