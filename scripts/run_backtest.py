@@ -12,10 +12,12 @@ validates part of the model, not the full 6.5-point score. The universe is
 today's, so delisted names are missing and results lean optimistic. Bars
 are split- and dividend-adjusted.
 
---baseline random also runs the backtest --seeds times with each day's
-picks drawn at random from the same candidates (same L0 gate, regime
-threshold and top_n), and prints the strategy next to the baseline's mean,
-standard deviation and range across seeds.
+--baseline random also runs two random baselines --seeds times each, with
+top_n picks a day drawn at random from (a) every ticker that passes the L0
+gate, and (b) the strategy's own candidates (L0 gate + regime-adjusted score
+threshold). It prints the strategy next to each baseline's mean, standard
+deviation and range across seeds: (a) vs (b) tests the threshold, (b) vs the
+strategy tests the ranking.
 
 Build the engine first (pip install -e engine) and export the history
 (python -m scripts.export_history). Thresholds come from backend/config.py.
@@ -73,30 +75,71 @@ BASELINE_FIELDS = (
 )
 
 
-def baseline_table(strategy: list[dict], runs: list[list[dict]]) -> str:
-    """Strategy vs random baseline: mean +/- sample stdev [min, max] across seeds."""
-    rows = [
-        f"| horizon | metric | strategy | random: mean +/- sd (n={len(runs)} seeds) "
-        "| random: min .. max | strategy pctile |",
-        "|---|---|---|---|---|---|",
-    ]
-    for hi, s in enumerate(strategy):
-        for key, label, scale, digits in BASELINE_FIELDS:
-            vals = [r[hi][key] for r in runs if r[hi][key] is not None]
-            fmt = lambda x: "n/a" if x is None else f"{x * scale:.{digits}f}"   # noqa: E731
-            if not vals or s[key] is None:
-                rows.append(f"| {s['horizon']}d | {label} | {fmt(s[key])} | n/a | n/a | n/a |")
+def _values(runs: list[list[dict]], hi: int, key: str) -> list[float]:
+    return [r[hi][key] for r in runs if r[hi][key] is not None]
+
+
+def _beats(a: list[float], b: list[float], key: str) -> float:
+    """Share of (a, b) pairs where a is better (ties half); lower drawdown is better."""
+    better = (lambda x, y: x < y) if key == "max_drawdown" else (lambda x, y: x > y)
+    return sum(1.0 if better(x, y) else 0.5 if x == y else 0.0 for x in a for y in b) / (len(a) * len(b))
+
+
+def comparison_tables(rows: dict[str, list[list[dict]]]) -> str:
+    """
+    rows: label -> one stats list per run (a single run for a deterministic
+    selection, one per seed for a random one). Prints mean +/- sample sd
+    across runs, the min .. max range, and how often each row beats the ones
+    above it.
+    """
+    labels = list(rows)
+    horizons = [s["horizon"] for s in next(iter(rows.values()))[0]]
+    fmt = lambda x, scale, digits: f"{x * scale:.{digits}f}"   # noqa: E731
+
+    def cell(runs: list[list[dict]], hi: int, key: str, scale: int, digits: int) -> str:
+        vals = _values(runs, hi, key)
+        if not vals:
+            return "n/a"
+        if len(vals) == 1:
+            return fmt(vals[0], scale, digits)
+        return f"{fmt(statistics.mean(vals), scale, digits)} +/- {fmt(statistics.stdev(vals), scale, digits)}"
+
+    out = ["| horizon | selection | " + " | ".join(f[1] for f in BASELINE_FIELDS) + " |",
+           "|---|---|" + "---|" * len(BASELINE_FIELDS)]
+    for hi, h in enumerate(horizons):
+        for label in labels:
+            out.append(f"| {h}d | {label} | "
+                       + " | ".join(cell(rows[label], hi, key, scale, digits)
+                                    for key, _, scale, digits in BASELINE_FIELDS)
+                       + " |")
+
+    out += ["", "Range across seeds (min .. max):", "",
+            "| horizon | selection | " + " | ".join(f[1] for f in BASELINE_FIELDS[:-1]) + " |",
+            "|---|---|" + "---|" * (len(BASELINE_FIELDS) - 1)]
+    for hi, h in enumerate(horizons):
+        for label in labels:
+            if len(rows[label]) < 2:
                 continue
-            sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
-            # share of random runs the strategy beats (ties count half); for
-            # drawdown lower is better
-            better = (lambda v: s[key] < v) if key == "max_drawdown" else (lambda v: s[key] > v)
-            beat = sum(1.0 if better(v) else 0.5 if v == s[key] else 0.0 for v in vals) / len(vals)
-            rows.append(f"| {s['horizon']}d | {label} | {fmt(s[key])} | "
-                        f"{fmt(statistics.mean(vals))} +/- {sd * scale:.{digits}f} | "
-                        f"{fmt(min(vals))} .. {fmt(max(vals))} | "
-                        f"{'' if key == 'n' else f'{beat * 100:.0f}%'} |")
-    return "\n".join(rows)
+            cells = []
+            for key, _, scale, digits in BASELINE_FIELDS[:-1]:
+                vals = _values(rows[label], hi, key)
+                cells.append(f"{fmt(min(vals), scale, digits)} .. {fmt(max(vals), scale, digits)}"
+                             if vals else "n/a")
+            out.append(f"| {h}d | {label} | " + " | ".join(cells) + " |")
+
+    pairs = [(a, b) for i, a in enumerate(labels) for b in labels[:i]]
+    out += ["", "Share of run pairs where the first beats the second (50% = no difference; "
+            "lower drawdown counts as better):", "",
+            "| horizon | comparison | " + " | ".join(f[1] for f in BASELINE_FIELDS[:-1]) + " |",
+            "|---|---|" + "---|" * (len(BASELINE_FIELDS) - 1)]
+    for hi, h in enumerate(horizons):
+        for a, b in pairs:
+            cells = []
+            for key, *_ in BASELINE_FIELDS[:-1]:
+                va, vb = _values(rows[a], hi, key), _values(rows[b], hi, key)
+                cells.append(f"{_beats(va, vb, key) * 100:.0f}%" if va and vb else "n/a")
+            out.append(f"| {h}d | {a} vs {b} | " + " | ".join(cells) + " |")
+    return "\n".join(out)
 
 
 def main() -> None:
@@ -115,7 +158,8 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=0, help="0 = every hardware thread")
     ap.add_argument("--picks-csv", type=Path, help="also write every pick to this CSV")
     ap.add_argument("--baseline", choices=("random",),
-                    help="also run a random-pick baseline from the same daily candidates")
+                    help="also run random-pick baselines from the L0 universe and the "
+                         "strategy's candidates")
     ap.add_argument("--seeds", type=int, default=20, help="random baseline runs (seeds 1..N)")
     args = ap.parse_args()
     if args.seeds < 2:
@@ -158,16 +202,22 @@ def main() -> None:
     print(stats_table(result["stats"]))
 
     if args.baseline == "random":
-        runs = [backtest(selection="random", seed=seed)["stats"] for seed in range(1, args.seeds + 1)]
+        seeds = range(1, args.seeds + 1)
+        rows = {
+            "universe-random": [backtest(selection="random_universe", seed=s)["stats"] for s in seeds],
+            "pool-random": [backtest(selection="random", seed=s)["stats"] for s in seeds],
+            "strategy": [result["stats"]],
+        }
         uncontested = result["num_days"] - result["contested_days"]
-        print(f"\nRandom baseline: each day, top {args.top_n} drawn uniformly from the same "
-              f"candidates the strategy chooses from, seeds 1..{args.seeds}. "
-              f"{result['contested_days']} of {result['num_days']} days have more than "
-              f"{args.top_n} candidates"
-              + (f"; on the other {uncontested} both pick the same set." if uncontested else ".")
-              + " sd and range are across seeds; pctile is the share of seeds the strategy "
-              "beats (lower is better for drawdown).\n")
-        print(baseline_table(result["stats"], runs))
+        print(f"\nRandom baselines, seeds 1..{args.seeds}, top {args.top_n} a day drawn uniformly:\n"
+              f"  universe-random: from every eligible ticker that passes the L0 gate that day "
+              f"(no score threshold, so the regime has no effect)\n"
+              f"  pool-random: from the candidates the strategy chooses from (L0 gate + score "
+              f"threshold, regime-adjusted). {result['contested_days']} of {result['num_days']} "
+              f"days have more than {args.top_n}"
+              + (f"; on the other {uncontested} it picks the strategy's set." if uncontested else ".")
+              + "\nsd and range are across seeds.\n")
+        print(comparison_tables(rows))
 
     if args.picks_csv:
         with args.picks_csv.open("w", newline="") as f:

@@ -258,8 +258,10 @@ py::dict run_backtest_py(const std::string& path, const py::dict& cfg_dict,
     cfg.selection = Selection::kTopScore;
   } else if (selection == "random") {
     cfg.selection = Selection::kRandom;
+  } else if (selection == "random_universe") {
+    cfg.selection = Selection::kRandomUniverse;
   } else {
-    throw std::invalid_argument("selection must be 'top_score' or 'random'");
+    throw std::invalid_argument("selection must be 'top_score', 'random' or 'random_universe'");
   }
   cfg.seed = seed;
 
@@ -344,5 +346,7 @@ PYBIND11_MODULE(mscan_engine, m) {
         py::arg("seed") = 0,
         "Backtest the PV-only score (layers 1 + 2) over the mmapped history file. "
         "num_threads=0 uses every hardware thread. selection='random' draws top_n "
-        "of each day's candidates at random (a baseline), reproducibly from seed.");
+        "of each day's candidates at random (a baseline), reproducibly from seed; "
+        "'random_universe' draws from every ticker that passes the L0 gate, ignoring "
+        "the score threshold.");
 }

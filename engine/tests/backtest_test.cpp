@@ -193,14 +193,23 @@ TEST(BacktestTest, PicksAreTopNAboveThresholdAndNeverSpy) {
   }
 }
 
-// Random baseline: the same seed reproduces the picks exactly, whatever the
+// Random baselines: the same seed reproduces the picks exactly, whatever the
 // thread count; another seed gives different ones.
-TEST(BacktestTest, RandomBaselineIsReproducibleFromItsSeed) {
+class RandomBaselineTest : public ::testing::TestWithParam<mscan::Selection> {};
+
+INSTANTIATE_TEST_SUITE_P(Backtest, RandomBaselineTest,
+                         ::testing::Values(mscan::Selection::kRandom,
+                                           mscan::Selection::kRandomUniverse),
+                         [](const auto& info) {
+                           return info.param == mscan::Selection::kRandom ? "Pool" : "Universe";
+                         });
+
+TEST_P(RandomBaselineTest, IsReproducibleFromItsSeed) {
   const Panel p = synthetic_panel(60, 400, 8);
   const auto u = p.universe();
   auto cfg = config_for(u, 1.0);
   cfg.top_n = 3;
-  cfg.selection = mscan::Selection::kRandom;
+  cfg.selection = GetParam();
   cfg.seed = 42;
   mscan::ThreadPool one(1), many(8);
   const auto a = mscan::run_backtest(u, 0, cfg, one);
@@ -226,9 +235,11 @@ TEST(BacktestTest, RandomBaselineIsReproducibleFromItsSeed) {
 }
 
 // Every random pick is a candidate the top-score run could have picked that
-// day: eligible, past the L0 gate and at or above the day's (regime)
-// threshold. Each day takes min(top_n, candidates), with no repeats.
-TEST(BacktestTest, RandomBaselinePicksOnlyFromTheEligibleCandidates) {
+// day. Pool: eligible, past the L0 gate and at or above the day's (regime)
+// threshold. Universe: eligible and past the L0 gate, any score, which is
+// the top-score run with every threshold below the lowest possible score.
+// Each day takes min(top_n, candidates), with no repeats.
+TEST_P(RandomBaselineTest, PicksOnlyFromTheEligibleCandidates) {
   // SPY drifts down then the regime flips often enough to hit bear days
   const Panel p = synthetic_panel(60, 500, 21, /*spy_drift=*/-0.0002);
   const auto u = p.universe();
@@ -240,18 +251,23 @@ TEST(BacktestTest, RandomBaselinePicksOnlyFromTheEligibleCandidates) {
 
   auto all_cfg = cfg;   // top_n past the universe size: every candidate
   all_cfg.top_n = static_cast<int>(u.num_tickers());
+  if (GetParam() == mscan::Selection::kRandomUniverse) {
+    all_cfg.min_pv_score = all_cfg.bear_min_pv_score = -1.0;   // PV scores are >= 0
+  }
   const auto all = mscan::run_backtest(u, 0, all_cfg, pool);
   std::vector<std::vector<std::uint32_t>> candidates(u.num_days());
   for (const auto& pk : all.picks) candidates[pk.day].push_back(pk.ticker_idx);
 
   cfg.top_n = 3;
-  cfg.selection = mscan::Selection::kRandom;
+  cfg.selection = GetParam();
   for (std::uint64_t seed : {1u, 2u, 3u}) {
     cfg.seed = seed;
     const auto r = mscan::run_backtest(u, 0, cfg, pool);
     ASSERT_GT(r.contested_days, 0u);
     std::vector<std::vector<std::uint32_t>> picked(u.num_days());
+    std::size_t below_threshold = 0;
     for (const auto& pk : r.picks) {
+      below_threshold += pk.score < cfg.min_pv_score;
       EXPECT_NE(cfg.eligible[pk.ticker_idx], 0) << "ineligible ticker " << pk.ticker_idx;
       const auto& c = candidates[pk.day];
       EXPECT_NE(std::find(c.begin(), c.end(), pk.ticker_idx), c.end())
@@ -263,6 +279,11 @@ TEST(BacktestTest, RandomBaselinePicksOnlyFromTheEligibleCandidates) {
       std::sort(picked[d].begin(), picked[d].end());
       EXPECT_EQ(std::adjacent_find(picked[d].begin(), picked[d].end()), picked[d].end())
           << "repeat pick on day " << d;
+    }
+    if (GetParam() == mscan::Selection::kRandom) {
+      EXPECT_EQ(below_threshold, 0u);
+    } else {
+      EXPECT_GT(below_threshold, 0u) << "universe draw never left the score pool";
     }
   }
   EXPECT_GT(all.bear_days, 0u) << "no bear days: the regime threshold went untested";

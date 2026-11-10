@@ -235,11 +235,15 @@ BacktestResult run_backtest(const Universe& u, std::size_t spy_idx, const Backte
   // kTopScore: highest scores, ties to the lower ticker index (alphabetical
   // within the equities, like the scanner's stable sort). kRandom: one rng
   // seeded once and consumed in day order, so picks depend only on the seed
-  // and the candidates, not on the thread count.
+  // and the candidates, not on the thread count. kRandomUniverse: same draw,
+  // but every L0 pass is a candidate (scores are NaN for the rest).
   std::mt19937_64 rng(cfg.seed);
   std::vector<std::pair<double, std::uint32_t>> candidates;
   for (std::size_t k = 0; k < days; ++k) {
-    const double threshold = bear[k] ? cfg.bear_min_pv_score : cfg.min_pv_score;
+    const double threshold = cfg.selection == Selection::kRandomUniverse
+                                 ? -std::numeric_limits<double>::infinity()
+                             : bear[k] ? cfg.bear_min_pv_score
+                                       : cfg.min_pv_score;
     result.bear_days += bear[k];
     candidates.clear();
     for (std::size_t i = 0; i < u.num_tickers(); ++i) {
@@ -248,7 +252,7 @@ BacktestResult run_backtest(const Universe& u, std::size_t spy_idx, const Backte
     }
     const std::size_t take = std::min(candidates.size(), static_cast<std::size_t>(cfg.top_n));
     result.contested_days += candidates.size() > take;
-    if (cfg.selection == Selection::kRandom) {
+    if (cfg.selection != Selection::kTopScore) {
       // Partial Fisher-Yates: after step c, candidates[0..c] is a uniform
       // random sample without replacement
       for (std::size_t c = 0; c < take; ++c) {

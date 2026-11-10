@@ -31,11 +31,16 @@ enum class FillPolicy { kCloseSameDay, kOpenNextDay };
 
 // How each day's picks are chosen from the candidates (tickers that pass the
 // L0 gate and score at or above that day's regime threshold).
-//   kTopScore: the top_n by score, ties to the lower ticker index.
-//   kRandom:   top_n drawn uniformly at random from the same candidates, a
-//              baseline for whether the score ranks better than chance.
-// Both take every candidate on days with top_n or fewer.
-enum class Selection { kTopScore, kRandom };
+//   kTopScore:       the top_n by score, ties to the lower ticker index.
+//   kRandom:         top_n drawn uniformly at random from the same
+//                    candidates, a baseline for whether the score ranks
+//                    better than chance.
+//   kRandomUniverse: top_n drawn at random from every eligible ticker that
+//                    passes the L0 gate that day, ignoring the score and so
+//                    the regime threshold too: a baseline for whether the
+//                    threshold picks a better pool than the whole universe.
+// All take every candidate on days with top_n or fewer.
+enum class Selection { kTopScore, kRandom, kRandomUniverse };
 
 struct BacktestConfig {
   std::size_t start_day = 0;      // index into universe dates
@@ -59,7 +64,7 @@ struct BacktestConfig {
   // Use it to keep SPY and the sector ETFs out of the picks.
   std::vector<std::uint8_t> eligible;
   Selection selection = Selection::kTopScore;
-  std::uint64_t seed = 0;         // kRandom only; the same seed gives the same picks
+  std::uint64_t seed = 0;         // random selections; the same seed gives the same picks
   ScoringConfig scoring;
 };
 
@@ -95,7 +100,7 @@ struct BacktestResult {
   std::size_t evaluations = 0;   // ticker-days scored
   std::size_t bear_days = 0;     // days the bear threshold applied
   // Days with more than top_n candidates, where the selection rule matters.
-  // On the other days kTopScore and kRandom pick the same set.
+  // On the other days the selection rule makes no difference.
   std::size_t contested_days = 0;
 };
 
