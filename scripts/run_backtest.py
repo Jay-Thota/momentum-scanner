@@ -34,6 +34,7 @@ import mscan_engine
 
 from backend import config
 from backend.data.fetcher_sector import SECTOR_PEERS
+from backend.data.security_types import etf_symbols
 from backend.scoring.cpp_engine import engine_config
 from scripts.read_history_bin import read_history_bin
 
@@ -164,6 +165,8 @@ def main() -> None:
     ap.add_argument("--tie-break", choices=("ticker", "signals"), default="ticker",
                     help="order of equal scores: ticker (alphabetical, like the scanner) or "
                          "layer 1 signals fired, then vol_ratio")
+    ap.add_argument("--include-etfs", action="store_true",
+                    help="keep exchange-flagged ETFs pickable (the live universe drops them)")
     args = ap.parse_args()
     if args.seeds < 2:
         ap.error("--seeds must be >= 2 to report a spread")
@@ -176,16 +179,23 @@ def main() -> None:
         "MIN_AVG_VOLUME": config.MIN_AVG_VOLUME,
         "SECTOR_SLOPE_MIN": config.SECTOR_SLOPE_MIN,
     }
+    history = read_history_bin(args.history)
     start = yyyymmdd(args.start) if args.start else None
     if start is None:
-        dates = read_history_bin(args.history)["dates"]
+        dates = history["dates"]
         start = int(dates[min(WARMUP_SESSIONS, len(dates) - 1)])
+
+    # Same rule as the live universe (backend/universe.py): no exchange-flagged
+    # ETFs. SPY stays in the file as the benchmark; it is never pickable.
+    symbols = {str(s) for s in history["symbols"]}
+    etfs = set() if args.include_etfs else (etf_symbols() & symbols) - set(SECTOR_PEERS) - {SPY}
+    exclude = sorted(set(SECTOR_PEERS) | etfs)
 
     def backtest(**selection) -> dict:
         return mscan_engine.run_backtest(
             str(args.history), cfg,
             start=start, end=yyyymmdd(args.end) if args.end else None,
-            exclude=sorted(SECTOR_PEERS), spy=SPY,
+            exclude=exclude, spy=SPY,
             top_n=args.top_n, min_pv_score=args.min_score, bear_min_pv_score=args.bear_min_score,
             horizons=args.horizons,
             fill="open_next_day" if args.fill == "open" else "close_same_day",
@@ -197,7 +207,10 @@ def main() -> None:
 
     fill = "next open" if args.fill == "open" else "same-day close"
     print(f"PV-only backtest {result['start']} .. {result['end']} "
-          f"({result['num_days']} sessions, {result['num_tickers']:,} tickers in the file)")
+          f"({result['num_days']} sessions, {result['num_tickers']:,} tickers in the file; "
+          f"not pickable: SPY, {len(SECTOR_PEERS)} sector ETFs"
+          + (", other ETFs kept" if args.include_etfs else
+             f", {len(etfs)} other exchange-flagged ETFs") + ")")
     print(f"top {args.top_n}, score >= {args.min_score} "
           f"({args.bear_min_score} on {result['bear_days']} bear days"
           f"{', regime filter off' if args.no_regime else ''}), fill at {fill}, "
