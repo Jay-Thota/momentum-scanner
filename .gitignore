@@ -25,6 +25,8 @@ scan_results/
 
 # FINRA data cache
 backend/data/finra_cache/
+# Nasdaq Trader symbol directory cache
+backend/data/symdir_cache/
 data/finra/
 
 # Next.js

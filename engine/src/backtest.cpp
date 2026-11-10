@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -48,16 +49,31 @@ bool passes_l0(const BarSeries& s, const BacktestConfig& cfg) {
   return s.close[n - 1] >= cfg.min_price && avg >= cfg.min_avg_volume;
 }
 
-// Selection phase: the PV score of every (ticker, day) in [start_day,
-// end_day], NaN when the ticker is ineligible, has no data yet, or fails the
-// gate. Stored ticker-major (scores[i * days + k]) so each worker writes one
-// contiguous block and never shares a cache line with another worker, apart
-// from the edges of its block.
-std::vector<double> score_all(const Universe& u, const BacktestConfig& cfg,
-                              const std::vector<std::uint8_t>& eligible, ThreadPool& pool,
-                              std::size_t& evaluations) {
+// Selection phase output, ticker-major ([i * days + k]) so each worker writes
+// one contiguous block and never shares a cache line with another worker,
+// apart from the edges of its block.
+struct ScoreMatrix {
+  // PV score of every (ticker, day) in [start_day, end_day]; NaN when the
+  // ticker is ineligible, has no data yet, or fails the gate
+  std::vector<double> scores;
+  // Tie-break keys, filled only for TieBreak::kSignalsThenVolume (empty
+  // otherwise, to skip ~20 MB on the real file)
+  std::vector<std::uint8_t> signals_fired;
+  std::vector<double> vol_ratio;
+};
+
+ScoreMatrix score_all(const Universe& u, const BacktestConfig& cfg,
+                      const std::vector<std::uint8_t>& eligible, ThreadPool& pool,
+                      std::size_t& evaluations) {
   const std::size_t days = cfg.end_day - cfg.start_day + 1;
-  std::vector<double> scores(u.num_tickers() * days, kNaN);
+  const bool keys = cfg.selection == Selection::kTopScore &&
+                    cfg.tie_break == TieBreak::kSignalsThenVolume;
+  ScoreMatrix m;
+  m.scores.assign(u.num_tickers() * days, kNaN);
+  if (keys) {
+    m.signals_fired.assign(m.scores.size(), 0);
+    m.vol_ratio.assign(m.scores.size(), kNaN);
+  }
   std::vector<std::size_t> evals(u.num_tickers(), 0);
 
   pool.parallel_for(u.num_tickers(), [&](std::size_t begin, std::size_t end) {
@@ -72,16 +88,20 @@ std::vector<double> score_all(const Universe& u, const BacktestConfig& cfg,
         state.update(s.open[last], s.high[last], s.low[last], s.close[last], s.volume[last]);
         if (d < cfg.start_day || !passes_l0(s, cfg)) continue;
         const IndicatorSnapshot snap = snapshot(state, cfg.scoring);
-        const double pv = score_layer1(s, 0, snap, cfg.scoring).score +
-                          score_layer2(s, std::nullopt, snap, cfg.scoring).total;
-        scores[i * days + (d - cfg.start_day)] = pv;
+        const Layer1Result l1 = score_layer1(s, 0, snap, cfg.scoring);
+        const std::size_t at = i * days + (d - cfg.start_day);
+        m.scores[at] = l1.score + score_layer2(s, std::nullopt, snap, cfg.scoring).total;
+        if (keys) {
+          m.signals_fired[at] = static_cast<std::uint8_t>(l1.signals_fired);
+          m.vol_ratio[at] = l1.vol_ratio;
+        }
         ++evals[i];
       }
     }
   });
   evaluations = 0;
   for (std::size_t e : evals) evaluations += e;
-  return scores;
+  return m;
 }
 
 // regime_filter.get_regime on SPY as of each day: bull when the close is
@@ -103,6 +123,22 @@ std::vector<bool> bear_days(const Universe& u, std::size_t spy_idx, const Backte
     bear[d - cfg.start_day] = !bull;
   }
   return bear;
+}
+
+// Uniform integer in [0, n). Not std::uniform_int_distribution: its algorithm
+// is up to the standard library, so libc++ (macOS) and libstdc++ (Linux CI)
+// would draw different picks from the same seed. mt19937_64's output is fixed
+// by the standard; rejecting the top partial block of 2^64 % n values keeps
+// the draw exactly uniform.
+std::size_t uniform_below(std::mt19937_64& rng, std::size_t n) {
+  const std::uint64_t range = n;
+  const std::uint64_t reject_from = std::numeric_limits<std::uint64_t>::max() -
+                                    std::numeric_limits<std::uint64_t>::max() % range;
+  std::uint64_t x;
+  do {
+    x = rng();
+  } while (x >= reject_from);
+  return static_cast<std::size_t>(x % range);
 }
 
 // Ticker i's open or close on day d; NaN before its first bar or past the end
@@ -210,16 +246,24 @@ BacktestResult run_backtest(const Universe& u, std::size_t spy_idx, const Backte
 
   BacktestResult result;
   const std::size_t days = cfg.end_day - cfg.start_day + 1;
-  const std::vector<double> scores = score_all(u, cfg, eligible, pool, result.evaluations);
+  const ScoreMatrix m = score_all(u, cfg, eligible, pool, result.evaluations);
+  const std::vector<double>& scores = m.scores;
   const std::vector<bool> bear = cfg.apply_regime_filter ? bear_days(u, spy_idx, cfg)
                                                          : std::vector<bool>(days, false);
 
-  // Picks: per day, the top_n scores at or above that day's threshold.
-  // Ties go to the lower ticker index (alphabetical within the equities, like
-  // the scanner's stable sort).
+  // Picks: per day, top_n of the candidates at or above that day's threshold.
+  // kTopScore: highest scores, ties broken by cfg.tie_break (by default the
+  // lower ticker index, like the scanner's stable sort). kRandom: one rng
+  // seeded once and consumed in day order, so picks depend only on the seed
+  // and the candidates, not on the thread count. kRandomUniverse: same draw,
+  // but every L0 pass is a candidate (scores are NaN for the rest).
+  std::mt19937_64 rng(cfg.seed);
   std::vector<std::pair<double, std::uint32_t>> candidates;
   for (std::size_t k = 0; k < days; ++k) {
-    const double threshold = bear[k] ? cfg.bear_min_pv_score : cfg.min_pv_score;
+    const double threshold = cfg.selection == Selection::kRandomUniverse
+                                 ? -std::numeric_limits<double>::infinity()
+                             : bear[k] ? cfg.bear_min_pv_score
+                                       : cfg.min_pv_score;
     result.bear_days += bear[k];
     candidates.clear();
     for (std::size_t i = 0; i < u.num_tickers(); ++i) {
@@ -227,10 +271,35 @@ BacktestResult run_backtest(const Universe& u, std::size_t spy_idx, const Backte
       if (s >= threshold) candidates.emplace_back(s, static_cast<std::uint32_t>(i));   // NaN fails
     }
     const std::size_t take = std::min(candidates.size(), static_cast<std::size_t>(cfg.top_n));
-    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(take),
-                      candidates.end(), [](const auto& a, const auto& b) {
-                        return a.first != b.first ? a.first > b.first : a.second < b.second;
-                      });
+    result.contested_days += candidates.size() > take;
+    if (cfg.selection != Selection::kTopScore) {
+      // Partial Fisher-Yates: after step c, candidates[0..c] is a uniform
+      // random sample without replacement
+      for (std::size_t c = 0; c < take; ++c) {
+        std::swap(candidates[c], candidates[c + uniform_below(rng, candidates.size() - c)]);
+      }
+    } else if (cfg.tie_break == TieBreak::kSignalsThenVolume) {
+      // NaN vol_ratio (no volume that day) sorts last; comparing NaN
+      // directly would break the strict weak ordering partial_sort needs
+      auto vol = [&](std::uint32_t i) {
+        const double v = m.vol_ratio[i * days + k];
+        return std::isnan(v) ? -std::numeric_limits<double>::infinity() : v;
+      };
+      std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(take),
+                        candidates.end(), [&](const auto& a, const auto& b) {
+                          if (a.first != b.first) return a.first > b.first;
+                          const auto sa = m.signals_fired[a.second * days + k];
+                          const auto sb = m.signals_fired[b.second * days + k];
+                          if (sa != sb) return sa > sb;
+                          const double va = vol(a.second), vb = vol(b.second);
+                          return va != vb ? va > vb : a.second < b.second;
+                        });
+    } else {
+      std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(take),
+                        candidates.end(), [](const auto& a, const auto& b) {
+                          return a.first != b.first ? a.first > b.first : a.second < b.second;
+                        });
+    }
     for (std::size_t c = 0; c < take; ++c) {
       Pick p;
       p.day = cfg.start_day + k;

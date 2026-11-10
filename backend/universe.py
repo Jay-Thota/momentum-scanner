@@ -1,8 +1,8 @@
 """
 backend/universe.py
 
-Dynamic tradable equity universe: NYSE + Nasdaq, alpha-only symbols,
-$500M market cap floor.  Cached to SQLite for 7 days.
+Dynamic tradable equity universe: NYSE + Nasdaq, alpha-only symbols, no
+exchange-flagged ETFs, $500M market cap floor.  Cached to SQLite for 7 days.
 
 Public API:
     get_universe(db=None, force_refresh=False) -> list[str]
@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend import config
+from backend.data.security_types import etf_symbols
 from backend.db.database import SessionLocal, init_db
 from backend.db.models import UniverseCache
 
@@ -125,8 +126,13 @@ def _fetch_fresh() -> tuple[list[dict], dict]:
         GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE)
     ))
 
+    # Exchange-flagged ETFs (Alpaca has no security type). Raises if the
+    # directory is unavailable, so get_universe serves the stale cache.
+    etfs = etf_symbols()
+
     target = {AssetExchange.NYSE, AssetExchange.NASDAQ}
     pre: list[dict] = []
+    etf_dropped: list[str] = []
     for a in assets:
         if a.exchange not in target:
             continue
@@ -137,10 +143,15 @@ def _fetch_fresh() -> tuple[list[dict], dict]:
             continue
         if sym in EXCLUSION_LIST:
             continue
+        if sym in etfs:
+            etf_dropped.append(sym)
+            continue
         exc = a.exchange.value if hasattr(a.exchange, "value") else str(a.exchange)
         pre.append({"ticker": sym, "exchange": exc, "name": (a.name or "")[:128]})
 
-    logger.info("Alpaca pre-filter: %d tickers (NYSE+Nasdaq, tradable, alpha, len<=5)", len(pre))
+    logger.info("Alpaca pre-filter: %d tickers (NYSE+Nasdaq, tradable, alpha, len<=5, not ETF)", len(pre))
+    logger.info("Dropped %d ETFs flagged in the Nasdaq Trader symbol directory: %s",
+                len(etf_dropped), ", ".join(sorted(etf_dropped)))
 
     logger.info("Fetching prices + volume via Alpaca for %d tickers ...", len(pre))
     pv_map = _batch_price_vol([r["ticker"] for r in pre])
@@ -173,6 +184,7 @@ def _fetch_fresh() -> tuple[list[dict], dict]:
     )
     refresh_stats = {
         "n_pre_filter": len(pre),
+        "n_etf":        len(etf_dropped),
         "n_no_data":    n_no_data,
         "n_low_price":  n_low_price,
         "n_low_vol":    n_low_vol,
@@ -233,8 +245,8 @@ def get_universe(
 
     Caches to SQLite for 7 days.  Pass force_refresh=True to bypass the cache.
     If db is None, opens its own session (backward-compatible call with no args).
-    Pass stats={} to receive refresh counters (n_pre_filter, n_no_data, n_low_price,
-    n_low_vol, nyse_n, nasd_n) when a fresh fetch occurs.
+    Pass stats={} to receive refresh counters (n_pre_filter, n_etf, n_no_data,
+    n_low_price, n_low_vol, nyse_n, nasd_n) when a fresh fetch occurs.
     """
     if db is None:
         init_db()

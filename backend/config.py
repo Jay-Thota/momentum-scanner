@@ -62,6 +62,11 @@ LAYER3_MIN_SIGNALS = int(os.getenv("LAYER3_MIN_SIGNALS", "2"))
 
 # Layer 4 -- short interest gate
 FINRA_SHORT_DATA_DIR = os.getenv("FINRA_SHORT_DATA_DIR", "backend/data/finra_cache")
+
+# Nasdaq Trader symbol directory (ETF flags; backend/data/security_types.py).
+# The universe refresh drops symbols it flags as ETFs.
+SYMDIR_CACHE_DIR = os.getenv("SYMDIR_CACHE_DIR", "backend/data/symdir_cache")
+SYMDIR_MAX_AGE_DAYS = float(os.getenv("SYMDIR_MAX_AGE_DAYS", "1"))
 REVENUE_GROWTH_MIN = float(os.getenv("REVENUE_GROWTH_MIN", "0.05"))
 
 # Layer 5 -- sector & macro alignment

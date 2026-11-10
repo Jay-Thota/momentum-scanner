@@ -7,7 +7,7 @@ A daily pipeline that scans ~3,300 NYSE and Nasdaq equities at 3:30 PM ET and pr
 The scanner runs in two stages each trading day:
 
 **Stage 1 -- Universe construction** (cached 7 days)
-Alpaca Markets free tier fetches all active NYSE/Nasdaq equities, then filters to ~3,300 tickers with price >= $5 and 5-day average volume >= 200K.
+Alpaca Markets free tier fetches all active NYSE/Nasdaq equities, drops symbols the exchanges flag as ETFs (Nasdaq Trader symbol directory), then filters to ~3,000 tickers with price >= $5 and 5-day average volume >= 200K. SPY, ^GSPC and the 11 sector ETFs are fetched separately for the regime filter and L5, so the ETF filter never removes them.
 
 **Stage 2 -- Daily scan** (runs at 3:30 PM ET, Mon-Fri)
 Each ticker in the universe is scored across five layers. Tickers need >= 4.0 / 6.5 points to appear on the watchlist. The top 10 by score are saved to the database and sent via email and Slack.
@@ -24,6 +24,13 @@ Each ticker in the universe is scored across five layers. Tickers need >= 4.0 / 
 | L5 | 1.5 | Sector and macro alignment -- sector ETF momentum, RS rank, bull/bear regime filter |
 
 In a bear regime the minimum score is raised to 5.0.
+
+### Known gaps
+
+The universe excludes funds by the exchanges' ETF flag, which is a rule, not a ticker list. Two kinds of fund get through it:
+
+- **Closed-end funds** (PDI, NAD, BHK, GAB and others) are not flagged as ETFs, and yfinance labels them `EQUITY`, so no free source here can remove them by rule. They stay in the universe. Business development companies, which Nasdaq names "Closed End Fund" (ARCC, GBDC), stay in too.
+- **ETNs are flagged inconsistently.** Some are marked as ETFs and removed (AMJB); others are not (VXX). VXX itself never reaches the universe because it lists on Cboe, and as of November 2026 no unflagged ETN is in it, but a new NYSE- or Nasdaq-listed one without the flag would get through.
 
 ## Tech stack
 
@@ -192,22 +199,24 @@ Reproduce with `python -m scripts.bench_step4` and the `mscan_bench` target (com
 ```bash
 python -m scripts.export_history          # once: 4 years of bars -> engine/data/history.bin
 python -m scripts.run_backtest            # add --fill close, --no-regime, --picks-csv picks.csv
+python -m scripts.run_backtest --baseline random   # vs random picks, 20 seeds
 ```
 
-PV-only score (layer 1 + layer 2, max 3.0), Step 2's price/volume gate, top 10 a day with score >= 2.0 (2.5 in a bear regime), entry at the next open, 2023-10-31 to 2026-10-28 (SPY +92%):
+PV-only score (layer 1 + layer 2, max 3.0), Step 2's price/volume gate, no ETFs, top 10 a day with score >= 2.0 (2.5 in a bear regime), entry at the next open, 2023-10-31 to 2026-10-28 (SPY +92%), 3,035 pickable tickers:
 
 | horizon | picks | hit rate vs SPY | mean return | mean excess vs SPY | Sharpe | max drawdown |
 |---|---|---|---|---|---|---|
-| 5d | 7,451 | 47.1% | +0.17% | -0.20% | 0.50 | 23.5% |
-| 10d | 7,399 | 45.9% | +0.67% | -0.12% | 1.02 | 21.8% |
-| 20d | 7,293 | 44.9% | +1.35% | -0.27% | 1.01 | 18.5% |
+| 5d | 7,443 | 48.1% | +0.18% | -0.18% | 0.51 | 23.2% |
+| 10d | 7,391 | 46.7% | +0.69% | -0.10% | 0.97 | 21.5% |
+| 20d | 7,285 | 45.8% | +1.37% | -0.25% | 0.98 | 20.5% |
 
-The picks made money but trailed SPY in a strong market. The more useful finding: the PV score saturates. On 542 of 751 days all ten picks tie at the 3.0 maximum (a median of 16 tickers score 3.0 each day), so the alphabetical tie-break chooses them. Taking every 3.0 scorer instead gives +0.05% 20-day excess, about flat. In the live scan, layers 3 to 5 add up to 3.5 more points and break most of those ties. So this shows the price/volume layers cannot rank on their own; it does not test the full model.
+The picks made money but trailed SPY in a strong market, and they do no better than chance. `--baseline random` draws ten a day at random, 20 seeds each, either from every ticker past the L0 gate or from the same candidates the strategy picks from (score at or above the threshold). Both random baselines land within a few hundredths of a percent of each other on excess return, so the threshold does not select a better pool; the strategy's ranking within the pool is below every random seed on 5-day Sharpe and inside the random spread at 10 and 20 days. The PV score also saturates: on 496 of 751 days all ten picks tie at the 3.0 maximum (a median of 14 tickers score 3.0 each day), so the alphabetical tie-break chooses them. An opt-in tie-break by layer 1 signal count and volume ratio (`--tie-break signals`) did worse on every metric in an earlier run that still included ETFs. In the live scan, layers 3 to 5 add up to 3.5 more points and break most of those ties. So this shows the price/volume layers cannot rank on their own; it does not test the full model.
 
 ### Limitations
 
 - **PV-only.** Options flow (L3), short interest (L4), market cap and earnings dates (L0), and sector ETF trend / RS rank (L5) have no free history, so the backtest scores only the price/volume part with its own threshold. The regime filter uses SPY in place of ^GSPC.
-- **Survivorship bias.** The universe is the June 2026 one. Stocks that delisted or fell out of the filters earlier are missing, so results lean optimistic. It also includes ETFs that pass the filters (T-bill funds like SHV and SGOV score a perfect 3.0 on steady drift).
+- **Survivorship bias.** The universe is the June 2026 one. Stocks that delisted or fell out of the filters earlier are missing, so results lean optimistic.
+- **ETFs by today's flags.** The backtest drops the 242 symbols in the file that the November 2026 symbol directory flags as ETFs, like the live universe (`--include-etfs` keeps them; T-bill funds like SHV and SGOV scored a perfect 3.0 on steady drift). Closed-end funds stay in (see Known gaps).
 - **Adjusted vs raw bars.** The history file uses split- and dividend-adjusted bars. The live scan requests Alpaca's default raw bars, so a split inside its lookback looks like a one-day crash to layers 1 and 2; the backtest never sees that.
 - **Aligned calendar.** 80 of 3,289 tickers have days with no bar; the backtest scores them with NaN on those days, while the live scan only sees the bars that exist.
 - **Costs.** No commissions, spread or slippage; fills at the open or close price.

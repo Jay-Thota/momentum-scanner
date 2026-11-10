@@ -63,3 +63,5 @@ jobs:
         run: python -m backend.tests.validate_api_signals
       - name: Universe refresh fallback
         run: python -m backend.tests.validate_universe_fallback
+      - name: Symbol directory ETF flags
+        run: python -m backend.tests.validate_security_types

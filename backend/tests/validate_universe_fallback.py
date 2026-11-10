@@ -7,6 +7,9 @@ Offline checks that a universe refresh never crashes get_universe():
   - The real alpaca-py ValidationError raised by get_all_assets falls back to
     the stale SQLite cache
   - Any other refresh error (network) also falls back to the stale cache
+  - Symbols the Nasdaq Trader directory flags as ETFs are dropped (even one
+    Alpaca lists as NYSE); if the directory is unavailable, the stale cache
+    is served rather than a universe with ETFs back in
   - With no cache at all, the hardcoded fallback list is returned
 
 No network or Alpaca keys needed: the Alpaca client and price fetch are
@@ -59,8 +62,10 @@ RAW_ASSETS = [
     _asset("THRU", "TXSE",   3),   # alpaca-py 0.43.4 has no AssetExchange.TXSE
     _asset("XYZQ", "TXSE",   4),
     _asset("SPY",  "ARCA",   5),   # valid model, filtered by exchange
+    _asset("SGOV", "NYSE",   6),   # Alpaca lists this ETF as NYSE; the symbol directory drops it
 ]
 STALE_TICKERS = ["MSFT", "NVDA"]
+ETFS = frozenset({"SGOV", "SPY", "QQQ"})
 
 
 class _ListHandler(logging.Handler):
@@ -113,15 +118,18 @@ def _real_validation_error() -> ValidationError:
     raise AssertionError("alpaca-py accepted TXSE -- the enum may have been updated")
 
 
-def _run(db: Session, client_cls: MagicMock, price_vol=None) -> tuple[list[str], list[str]]:
+def _run(db: Session, client_cls: MagicMock, price_vol=None,
+         etfs=lambda: ETFS) -> tuple[list[str], list[str]]:
     price_vol = price_vol or (lambda tickers: {t: (150.0, 5_000_000.0) for t in tickers})
     handler = _ListHandler()
     logger = logging.getLogger("backend.universe")
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
     try:
         with patch.object(config, "ALPACA_API_KEY", "test"), \
              patch.object(config, "ALPACA_SECRET_KEY", "test"), \
              patch("alpaca.trading.client.TradingClient", client_cls), \
+             patch.object(universe, "etf_symbols", side_effect=etfs), \
              patch.object(universe, "_batch_price_vol", side_effect=price_vol):
             tickers = universe.get_universe(db, force_refresh=True)
     finally:
@@ -143,6 +151,9 @@ def main() -> None:
     ok &= _pf("TXSE=2" in skip_log and "THRU" in skip_log, "TXSE skips logged", skip_log)
     cached = sorted(r.ticker for r in db.query(UniverseCache).all())
     ok &= _pf(cached == ["AAPL", "JPM"], "cache rebuilt", str(cached))
+    etf_log = next((m for m in logs if "ETFs flagged" in m), "")
+    ok &= _pf("Dropped 1 ETFs" in etf_log and "SGOV" in etf_log,
+              "NYSE-listed ETF dropped by the symbol directory and logged", etf_log)
 
     # 2. alpaca-py's own ValidationError -> stale cache
     print("\n  2. get_all_assets raises the alpaca-py ValidationError")
@@ -162,6 +173,17 @@ def main() -> None:
     tickers, logs = _run(db, _client_returning(raw=RAW_ASSETS), price_vol=_boom)
     ok &= _pf(tickers == STALE_TICKERS, "stale cache returned", str(tickers))
     ok &= _pf(any("ConnectionError" in m for m in logs), "failure logged")
+
+    # 3b. Symbol directory unavailable -> stale cache, not a universe with ETFs
+    print("\n  3b. Symbol directory unavailable")
+    db = _session(seed_stale=True)
+
+    def _no_directory():
+        raise RuntimeError("symbol directory nasdaqlisted.txt unavailable and not cached")
+
+    tickers, logs = _run(db, _client_returning(raw=RAW_ASSETS), etfs=_no_directory)
+    ok &= _pf(tickers == STALE_TICKERS, "stale cache returned", str(tickers))
+    ok &= _pf(any("Universe refresh failed: RuntimeError" in m for m in logs), "failure logged")
 
     # 4. No cache at all -> hardcoded fallback
     print("\n  4. Refresh fails and the cache is empty")

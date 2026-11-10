@@ -29,6 +29,28 @@ namespace mscan {
 
 enum class FillPolicy { kCloseSameDay, kOpenNextDay };
 
+// How each day's picks are chosen from the candidates (tickers that pass the
+// L0 gate and score at or above that day's regime threshold).
+//   kTopScore:       the top_n by score, ties to the lower ticker index.
+//   kRandom:         top_n drawn uniformly at random from the same
+//                    candidates, a baseline for whether the score ranks
+//                    better than chance.
+//   kRandomUniverse: top_n drawn at random from every eligible ticker that
+//                    passes the L0 gate that day, ignoring the score and so
+//                    the regime threshold too: a baseline for whether the
+//                    threshold picks a better pool than the whole universe.
+// All take every candidate on days with top_n or fewer.
+enum class Selection { kTopScore, kRandom, kRandomUniverse };
+
+// kTopScore's order among equal PV scores. The score is mostly pass/fail
+// checks, so it ties a lot (all 10 picks at 3.0 on most days).
+//   kTicker:           lower ticker index first (alphabetical within the
+//                      equities), like the scanner's stable sort.
+//   kSignalsThenVolume: more layer 1 signals fired first (2..5; the score
+//                      only records >= 2), then higher layer 1 vol_ratio
+//                      (as stored, rounded to 3 places), then ticker index.
+enum class TieBreak { kTicker, kSignalsThenVolume };
+
 struct BacktestConfig {
   std::size_t start_day = 0;      // index into universe dates
   std::size_t end_day = 0;        // inclusive
@@ -50,6 +72,9 @@ struct BacktestConfig {
   // eligible[i] != 0: ticker i can be picked. Empty: every ticker but SPY.
   // Use it to keep SPY and the sector ETFs out of the picks.
   std::vector<std::uint8_t> eligible;
+  Selection selection = Selection::kTopScore;
+  TieBreak tie_break = TieBreak::kTicker;   // kTopScore only
+  std::uint64_t seed = 0;         // random selections; the same seed gives the same picks
   ScoringConfig scoring;
 };
 
@@ -84,6 +109,9 @@ struct BacktestResult {
   double elapsed_ms;
   std::size_t evaluations = 0;   // ticker-days scored
   std::size_t bear_days = 0;     // days the bear threshold applied
+  // Days with more than top_n candidates, where the selection rule matters.
+  // On the other days the selection rule makes no difference.
+  std::size_t contested_days = 0;
 };
 
 // spy_idx: index of SPY inside the universe (benchmark + regime filter).
