@@ -11,6 +11,7 @@ The scheduler blocks until interrupted (Ctrl+C / SIGTERM).
 """
 
 import logging
+import threading
 import time
 import traceback
 from datetime import date, datetime
@@ -18,9 +19,12 @@ from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo("America/New_York")
 
+from apscheduler.schedulers.base import BaseScheduler
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.base import BaseTrigger
 from apscheduler.triggers.cron import CronTrigger
 
+from backend import config
 from backend.alerts.email_alert import send_failure_email, send_watchlist_email
 from backend.alerts.slack_alert import send_slack_alert
 from backend.db.database import init_db
@@ -127,6 +131,37 @@ def run_scan_job(force: bool = False, stats: dict | None = None) -> list:
 # Entry point -- blocking scheduler
 # ---------------------------------------------------------------------------
 
+def add_scan_job(scheduler: BaseScheduler, trigger: BaseTrigger, func=run_scan_job):
+    """Add the daily scan job with the misfire policy from config."""
+    return scheduler.add_job(
+        func,
+        trigger=trigger,
+        id="daily_scan",
+        name="Daily 3:30 PM ET momentum scan",
+        # run a late scan (Mac asleep at 3:30) if within the grace period
+        misfire_grace_time=config.SCAN_MISFIRE_GRACE_SECONDS,
+        coalesce=True,            # run at most once if multiple misfires stack up
+    )
+
+
+def start_wakeup_thread(scheduler: BaseScheduler, interval: float) -> threading.Thread:
+    """
+    Call scheduler.wakeup() every `interval` seconds. Between jobs APScheduler
+    waits on a single timeout until the next run time, which can run long
+    past 3:30 PM when the Mac sleeps through it; the wakeups make it re-check
+    the clock, so a due scan starts within about `interval` of waking.
+    """
+    def loop() -> None:
+        while True:
+            time.sleep(interval)
+            if scheduler.running:   # wakeup() before start() has no event to set
+                scheduler.wakeup()
+
+    thread = threading.Thread(target=loop, name="scheduler-wakeup", daemon=True)
+    thread.start()
+    return thread
+
+
 def main() -> None:
     init_db()
     scheduler = BlockingScheduler(timezone="America/New_York")
@@ -137,16 +172,14 @@ def main() -> None:
         minute=30,
         timezone="America/New_York",
     )
-    scheduler.add_job(
-        run_scan_job,
-        trigger=trigger,
-        id="daily_scan",
-        name="Daily 3:30 PM ET momentum scan",
-        misfire_grace_time=300,   # fire within 5 minutes of missed trigger
-        coalesce=True,            # run at most once if multiple misfires stack up
-    )
+    add_scan_job(scheduler, trigger)
+    start_wakeup_thread(scheduler, config.SCHEDULER_WAKEUP_SECONDS)
 
-    logger.info("Scheduler started -- daily scan fires Mon-Fri at 15:30 America/New_York")
+    logger.info(
+        "Scheduler started -- daily scan fires Mon-Fri at 15:30 America/New_York "
+        "(runs up to %.1f h late; clock re-checked every %d s)",
+        config.SCAN_MISFIRE_GRACE_SECONDS / 3600, config.SCHEDULER_WAKEUP_SECONDS,
+    )
 
     # Compute next fire time directly from the trigger before scheduler.start() blocks.
     # (Accessing job.next_run_time before start() raises AttributeError in APScheduler 3.x)

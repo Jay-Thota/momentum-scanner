@@ -50,6 +50,13 @@ USE_CPP_ENGINE = os.getenv("USE_CPP_ENGINE", "false").strip().lower() in ("1", "
 # Python path's time (~15 s), so leave it off otherwise.
 CPP_ENGINE_SHADOW = os.getenv("CPP_ENGINE_SHADOW", "false").strip().lower() in ("1", "true", "yes", "on")
 
+# Scheduler. A scan that fires up to SCAN_MISFIRE_GRACE_SECONDS late (the Mac
+# was asleep at 3:30 PM) still runs; later than that it is skipped. The
+# scheduler re-checks the clock every SCHEDULER_WAKEUP_SECONDS so it notices a
+# due scan soon after the Mac wakes instead of finishing a long timed wait.
+SCAN_MISFIRE_GRACE_SECONDS = int(os.getenv("SCAN_MISFIRE_GRACE_SECONDS", "10800"))
+SCHEDULER_WAKEUP_SECONDS = int(os.getenv("SCHEDULER_WAKEUP_SECONDS", "60"))
+
 # Layer 3 -- options flow
 # Signal A: call_vol/call_OI ratio threshold, tiered by avg daily option volume
 # (call_vol + put_vol from front expiry chain)
