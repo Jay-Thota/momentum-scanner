@@ -7,7 +7,7 @@ A daily pipeline that scans ~3,300 NYSE and Nasdaq equities at 3:30 PM ET and pr
 The scanner runs in two stages each trading day:
 
 **Stage 1 -- Universe construction** (cached 7 days)
-Alpaca Markets free tier fetches all active NYSE/Nasdaq equities, then filters to ~3,300 tickers with price >= $5 and 5-day average volume >= 200K.
+Alpaca Markets free tier fetches all active NYSE/Nasdaq equities, drops symbols the exchanges flag as ETFs (Nasdaq Trader symbol directory), then filters to ~3,000 tickers with price >= $5 and 5-day average volume >= 200K. SPY, ^GSPC and the 11 sector ETFs are fetched separately for the regime filter and L5, so the ETF filter never removes them.
 
 **Stage 2 -- Daily scan** (runs at 3:30 PM ET, Mon-Fri)
 Each ticker in the universe is scored across five layers. Tickers need >= 4.0 / 6.5 points to appear on the watchlist. The top 10 by score are saved to the database and sent via email and Slack.
@@ -24,6 +24,13 @@ Each ticker in the universe is scored across five layers. Tickers need >= 4.0 / 
 | L5 | 1.5 | Sector and macro alignment -- sector ETF momentum, RS rank, bull/bear regime filter |
 
 In a bear regime the minimum score is raised to 5.0.
+
+### Known gaps
+
+The universe excludes funds by the exchanges' ETF flag, which is a rule, not a ticker list. Two kinds of fund get through it:
+
+- **Closed-end funds** (PDI, NAD, BHK, GAB and others) are not flagged as ETFs, and yfinance labels them `EQUITY`, so no free source here can remove them by rule. They stay in the universe. Business development companies, which Nasdaq names "Closed End Fund" (ARCC, GBDC), stay in too.
+- **ETNs are flagged inconsistently.** Some are marked as ETFs and removed (AMJB); others are not (VXX). VXX itself never reaches the universe because it lists on Cboe, and as of November 2026 no unflagged ETN is in it, but a new NYSE- or Nasdaq-listed one without the flag would get through.
 
 ## Tech stack
 
@@ -207,7 +214,8 @@ The picks made money but trailed SPY in a strong market. The more useful finding
 ### Limitations
 
 - **PV-only.** Options flow (L3), short interest (L4), market cap and earnings dates (L0), and sector ETF trend / RS rank (L5) have no free history, so the backtest scores only the price/volume part with its own threshold. The regime filter uses SPY in place of ^GSPC.
-- **Survivorship bias.** The universe is the June 2026 one. Stocks that delisted or fell out of the filters earlier are missing, so results lean optimistic. It also includes ETFs that pass the filters (T-bill funds like SHV and SGOV score a perfect 3.0 on steady drift).
+- **Survivorship bias.** The universe is the June 2026 one. Stocks that delisted or fell out of the filters earlier are missing, so results lean optimistic.
+- **ETFs by today's flags.** The backtest drops the 242 symbols in the file that the November 2026 symbol directory flags as ETFs, like the live universe (`--include-etfs` keeps them; T-bill funds like SHV and SGOV scored a perfect 3.0 on steady drift). Closed-end funds stay in (see Known gaps).
 - **Adjusted vs raw bars.** The history file uses split- and dividend-adjusted bars. The live scan requests Alpaca's default raw bars, so a split inside its lookback looks like a one-day crash to layers 1 and 2; the backtest never sees that.
 - **Aligned calendar.** 80 of 3,289 tickers have days with no bar; the backtest scores them with NaN on those days, while the live scan only sees the bars that exist.
 - **Costs.** No commissions, spread or slippage; fills at the open or close price.
