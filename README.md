@@ -30,9 +30,9 @@ In a bear regime the minimum score is raised to 5.0.
 - **Backend** -- Python 3.11, FastAPI, SQLAlchemy, APScheduler
 - **Engine** -- C++20 scoring library and backtester, pybind11 bindings, GoogleTest, Google Benchmark
 - **Data** -- Alpaca Markets (OHLCV), yfinance (fundamentals, options, short interest), FINRA SSHO files (short interest)
-- **Database** -- SQLite locally, PostgreSQL on Railway
+- **Database** -- SQLite (PostgreSQL via `DATABASE_URL` if deployed)
 - **Frontend** -- Next.js 15, TypeScript, Tailwind CSS, TradingView chart widget
-- **Deployment** -- Railway (API + scheduler), Vercel (frontend)
+- **Deployment** -- scheduler runs locally under macOS launchd; Vercel (frontend); Dockerfile ready for Railway (not currently deployed)
 
 ## Project structure
 
@@ -214,7 +214,25 @@ The picks made money but trailed SPY in a strong market. The more useful finding
 
 ## Deployment
 
-### Railway (API + scheduler)
+The daily scan currently runs on a Mac under launchd (below). The Railway setup is
+documented and the Docker image builds and passes the parity tests locally, but no
+Railway project is deployed right now.
+
+### macOS background scheduler (launchd)
+
+A launchd plist is included to run the scheduler as a persistent background process without a terminal:
+
+```bash
+bash scripts/start_scheduler.sh   # load and start
+bash scripts/stop_scheduler.sh    # unload
+bash scripts/check_scheduler.sh   # status + recent log lines
+```
+
+The plist is at `~/Library/LaunchAgents/com.momentumscanner.plist`. It runs `venv/bin/python -m backend.scheduler` from the repo checkout and reads `.env`, so engine flags go there. After changing `.env` or rebuilding the engine (`venv/bin/pip install -e engine`), restart it with `launchctl kickstart -k gui/$(id -u)/com.momentumscanner`. Logs write to `logs/scheduler.log` and `logs/scheduler_error.log`.
+
+A sleeping Mac misses the 3:30 PM run (APScheduler runs it late on wake). To wake it on weekdays: `sudo pmset repeat wakeorpoweron MTWRF 15:20:00`.
+
+### Railway (API + scheduler, optional)
 
 1. Create a new Railway project and connect the GitHub repo.
 2. Add a PostgreSQL plugin -- Railway injects `DATABASE_URL` automatically.
@@ -232,18 +250,6 @@ The Dockerfile also builds the C++ engine. Set `USE_CPP_ENGINE=true` to score St
 1. Import the repo into Vercel and set the root directory to `frontend`.
 2. Set `NEXT_PUBLIC_API_URL` to your Railway API URL.
 3. After deploying, lock CORS in `backend/api/app.py` by replacing `allow_origins=["*"]` with your Vercel URL.
-
-### macOS background scheduler (launchd)
-
-A launchd plist is included to run the scheduler as a persistent background process without a terminal:
-
-```bash
-bash scripts/start_scheduler.sh   # load and start
-bash scripts/stop_scheduler.sh    # unload
-bash scripts/check_scheduler.sh   # status + recent log lines
-```
-
-The plist is at `~/Library/LaunchAgents/com.momentumscanner.plist`. Logs write to `logs/scheduler.log` and `logs/scheduler_error.log`.
 
 ## Data sources and cost
 
