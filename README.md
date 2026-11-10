@@ -199,17 +199,18 @@ Reproduce with `python -m scripts.bench_step4` and the `mscan_bench` target (com
 ```bash
 python -m scripts.export_history          # once: 4 years of bars -> engine/data/history.bin
 python -m scripts.run_backtest            # add --fill close, --no-regime, --picks-csv picks.csv
+python -m scripts.run_backtest --baseline random   # vs random picks, 20 seeds
 ```
 
-PV-only score (layer 1 + layer 2, max 3.0), Step 2's price/volume gate, top 10 a day with score >= 2.0 (2.5 in a bear regime), entry at the next open, 2023-10-31 to 2026-10-28 (SPY +92%):
+PV-only score (layer 1 + layer 2, max 3.0), Step 2's price/volume gate, no ETFs, top 10 a day with score >= 2.0 (2.5 in a bear regime), entry at the next open, 2023-10-31 to 2026-10-28 (SPY +92%), 3,035 pickable tickers:
 
 | horizon | picks | hit rate vs SPY | mean return | mean excess vs SPY | Sharpe | max drawdown |
 |---|---|---|---|---|---|---|
-| 5d | 7,451 | 47.1% | +0.17% | -0.20% | 0.50 | 23.5% |
-| 10d | 7,399 | 45.9% | +0.67% | -0.12% | 1.02 | 21.8% |
-| 20d | 7,293 | 44.9% | +1.35% | -0.27% | 1.01 | 18.5% |
+| 5d | 7,443 | 48.1% | +0.18% | -0.18% | 0.51 | 23.2% |
+| 10d | 7,391 | 46.7% | +0.69% | -0.10% | 0.97 | 21.5% |
+| 20d | 7,285 | 45.8% | +1.37% | -0.25% | 0.98 | 20.5% |
 
-The picks made money but trailed SPY in a strong market. The more useful finding: the PV score saturates. On 542 of 751 days all ten picks tie at the 3.0 maximum (a median of 16 tickers score 3.0 each day), so the alphabetical tie-break chooses them. Taking every 3.0 scorer instead gives +0.05% 20-day excess, about flat. In the live scan, layers 3 to 5 add up to 3.5 more points and break most of those ties. So this shows the price/volume layers cannot rank on their own; it does not test the full model.
+The picks made money but trailed SPY in a strong market, and they do no better than chance. `--baseline random` draws ten a day at random, 20 seeds each, either from every ticker past the L0 gate or from the same candidates the strategy picks from (score at or above the threshold). Both random baselines land within a few hundredths of a percent of each other on excess return, so the threshold does not select a better pool; the strategy's ranking within the pool is below every random seed on 5-day Sharpe and inside the random spread at 10 and 20 days. The PV score also saturates: on 496 of 751 days all ten picks tie at the 3.0 maximum (a median of 14 tickers score 3.0 each day), so the alphabetical tie-break chooses them. An opt-in tie-break by layer 1 signal count and volume ratio (`--tie-break signals`) did worse on every metric in an earlier run that still included ETFs. In the live scan, layers 3 to 5 add up to 3.5 more points and break most of those ties. So this shows the price/volume layers cannot rank on their own; it does not test the full model.
 
 ### Limitations
 
