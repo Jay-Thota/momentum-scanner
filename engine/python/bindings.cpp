@@ -231,7 +231,7 @@ py::dict run_backtest_py(const std::string& path, const py::dict& cfg_dict,
                          int top_n, double min_pv_score, double bear_min_pv_score,
                          std::vector<int> horizons, const std::string& fill, bool regime_filter,
                          std::size_t num_threads, const std::string& selection,
-                         std::uint64_t seed) {
+                         std::uint64_t seed, const std::string& tie_break) {
   // Mapping the file and building the config only read Python objects up
   // front; the backtest itself runs without the GIL.
   Universe u = Universe::open_mmap(path);
@@ -264,6 +264,13 @@ py::dict run_backtest_py(const std::string& path, const py::dict& cfg_dict,
     throw std::invalid_argument("selection must be 'top_score', 'random' or 'random_universe'");
   }
   cfg.seed = seed;
+  if (tie_break == "ticker") {
+    cfg.tie_break = TieBreak::kTicker;
+  } else if (tie_break == "signals_then_volume") {
+    cfg.tie_break = TieBreak::kSignalsThenVolume;
+  } else {
+    throw std::invalid_argument("tie_break must be 'ticker' or 'signals_then_volume'");
+  }
 
   std::optional<std::size_t> spy_idx;
   cfg.eligible.assign(u.num_tickers(), 1);
@@ -343,10 +350,11 @@ PYBIND11_MODULE(mscan_engine, m) {
         py::arg("horizons") = std::vector<int>{5, 10, 20},
         py::arg("fill") = "open_next_day", py::arg("regime_filter") = true,
         py::arg("num_threads") = 0, py::arg("selection") = "top_score",
-        py::arg("seed") = 0,
+        py::arg("seed") = 0, py::arg("tie_break") = "ticker",
         "Backtest the PV-only score (layers 1 + 2) over the mmapped history file. "
         "num_threads=0 uses every hardware thread. selection='random' draws top_n "
         "of each day's candidates at random (a baseline), reproducibly from seed; "
         "'random_universe' draws from every ticker that passes the L0 gate, ignoring "
-        "the score threshold.");
+        "the score threshold. tie_break='signals_then_volume' orders equal scores by "
+        "layer 1 signals fired, then vol_ratio, then ticker (default: ticker).");
 }

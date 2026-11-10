@@ -42,6 +42,15 @@ enum class FillPolicy { kCloseSameDay, kOpenNextDay };
 // All take every candidate on days with top_n or fewer.
 enum class Selection { kTopScore, kRandom, kRandomUniverse };
 
+// kTopScore's order among equal PV scores. The score is mostly pass/fail
+// checks, so it ties a lot (all 10 picks at 3.0 on most days).
+//   kTicker:           lower ticker index first (alphabetical within the
+//                      equities), like the scanner's stable sort.
+//   kSignalsThenVolume: more layer 1 signals fired first (2..5; the score
+//                      only records >= 2), then higher layer 1 vol_ratio
+//                      (as stored, rounded to 3 places), then ticker index.
+enum class TieBreak { kTicker, kSignalsThenVolume };
+
 struct BacktestConfig {
   std::size_t start_day = 0;      // index into universe dates
   std::size_t end_day = 0;        // inclusive
@@ -64,6 +73,7 @@ struct BacktestConfig {
   // Use it to keep SPY and the sector ETFs out of the picks.
   std::vector<std::uint8_t> eligible;
   Selection selection = Selection::kTopScore;
+  TieBreak tie_break = TieBreak::kTicker;   // kTopScore only
   std::uint64_t seed = 0;         // random selections; the same seed gives the same picks
   ScoringConfig scoring;
 };

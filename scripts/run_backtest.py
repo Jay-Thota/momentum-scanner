@@ -161,6 +161,9 @@ def main() -> None:
                     help="also run random-pick baselines from the L0 universe and the "
                          "strategy's candidates")
     ap.add_argument("--seeds", type=int, default=20, help="random baseline runs (seeds 1..N)")
+    ap.add_argument("--tie-break", choices=("ticker", "signals"), default="ticker",
+                    help="order of equal scores: ticker (alphabetical, like the scanner) or "
+                         "layer 1 signals fired, then vol_ratio")
     args = ap.parse_args()
     if args.seeds < 2:
         ap.error("--seeds must be >= 2 to report a spread")
@@ -189,14 +192,16 @@ def main() -> None:
             regime_filter=not args.no_regime, num_threads=args.threads, **selection,
         )
 
-    result = backtest()
+    tie_break = "signals_then_volume" if args.tie_break == "signals" else "ticker"
+    result = backtest(tie_break=tie_break)
 
     fill = "next open" if args.fill == "open" else "same-day close"
     print(f"PV-only backtest {result['start']} .. {result['end']} "
           f"({result['num_days']} sessions, {result['num_tickers']:,} tickers in the file)")
     print(f"top {args.top_n}, score >= {args.min_score} "
           f"({args.bear_min_score} on {result['bear_days']} bear days"
-          f"{', regime filter off' if args.no_regime else ''}), fill at {fill}")
+          f"{', regime filter off' if args.no_regime else ''}), fill at {fill}, "
+          f"ties by {'L1 signals, then vol_ratio' if args.tie_break == 'signals' else 'ticker'}")
     print(f"{len(result['picks']):,} picks from {result['evaluations']:,} ticker-days scored "
           f"in {result['elapsed_ms'] / 1000:.2f} s\n")
     print(stats_table(result["stats"]))
@@ -206,8 +211,11 @@ def main() -> None:
         rows = {
             "universe-random": [backtest(selection="random_universe", seed=s)["stats"] for s in seeds],
             "pool-random": [backtest(selection="random", seed=s)["stats"] for s in seeds],
-            "strategy": [result["stats"]],
         }
+        if args.tie_break != "ticker":   # the scanner's own tie order, for reference
+            rows["strategy, ticker ties"] = [backtest()["stats"]]
+        rows["strategy" if args.tie_break == "ticker" else f"strategy, {args.tie_break} ties"] = \
+            [result["stats"]]
         uncontested = result["num_days"] - result["contested_days"]
         print(f"\nRandom baselines, seeds 1..{args.seeds}, top {args.top_n} a day drawn uniformly:\n"
               f"  universe-random: from every eligible ticker that passes the L0 gate that day "
